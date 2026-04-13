@@ -559,43 +559,50 @@ impl InstructionBuilder {
         Ok(tx)
     }
 
-    /// Get the RPC client reference
+    /// Get the write-path RPC client reference
     pub fn rpc(&self) -> &RpcClient {
         &self.rpc
     }
+
+    /// Get the read-path RPC client reference (used for balance polls on sells)
+    pub fn rpc_read(&self) -> &RpcClient {
+        &self.rpc_read
+    }
 }
 
-/// Poll token balance from RPC with retries and backoff.
+/// Poll token balance from RPC with retries and tight backoff.
 ///
-/// Extracted as a standalone function so it can run concurrently via `tokio::join!`
-/// alongside bonding curve and blockhash fetches.
+/// Fires both `getTokenAccountBalance` and `getAccountInfo(jsonParsed)` in parallel
+/// per attempt — whichever returns a positive balance first wins.
 ///
-/// Override defaults with `BIGAL_SELL_BALANCE_RETRIES` (default 20) and
-/// `BIGAL_SELL_BALANCE_POLL_MS` (default 200ms base).
+/// Override defaults with `BIGAL_SELL_BALANCE_RETRIES` (default 8) and
+/// `BIGAL_SELL_BALANCE_POLL_MS` (default 80ms base, +15ms/attempt, cap 400ms).
 async fn poll_token_balance(rpc_read: &RpcClient, user_ata: &Pubkey) -> Result<u64> {
     let max_attempts: u32 = env::var("BIGAL_SELL_BALANCE_RETRIES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+        .unwrap_or(8);
     let base_poll_ms: u64 = env::var("BIGAL_SELL_BALANCE_POLL_MS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(200);
+        .unwrap_or(80);
 
     for attempt in 0..max_attempts {
-        let bal = match rpc_read.get_token_account_balance(user_ata).await {
+        // Fire both balance methods in parallel — saves one RPC round-trip per attempt
+        let (primary, fallback) = tokio::join!(
+            rpc_read.get_token_account_balance(user_ata),
+            rpc_read.get_token_balance_json_parsed(user_ata),
+        );
+        let bal = match primary {
             Ok(b) if b > 0 => b,
-            Ok(_) | Err(_) => rpc_read
-                .get_token_balance_json_parsed(user_ata)
-                .await
-                .unwrap_or(0),
+            _ => fallback.unwrap_or(0),
         };
         if bal > 0 {
             return Ok(bal);
         }
         if attempt < max_attempts - 1 {
-            let extra = (attempt as u64).saturating_mul(20).min(350);
-            let delay_ms = (base_poll_ms + extra).min(1200);
+            let extra = (attempt as u64).saturating_mul(15).min(320);
+            let delay_ms = (base_poll_ms + extra).min(400);
             debug!(
                 "SELL: token balance 0, retrying in {}ms (attempt {}/{})",
                 delay_ms,

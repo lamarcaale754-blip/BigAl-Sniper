@@ -142,36 +142,67 @@ async fn main() -> Result<()> {
     // so sells can skip the RPC polling loop entirely (Phase 2)
     let balance_cache = Arc::new(BalanceCache::new(300)); // 5-minute expiry
 
-    // Rolling blockhash pre-fetch: polls every 2s so trades never wait for a blockhash (Phase 3)
-    let blockhash_handle = BlockhashCache::start_polling(cfg.rpc_url.clone(), 2_000);
+    // Rolling blockhash pre-fetch — fresher hashes mean fewer cache misses under sell pressure
+    let bh_poll_ms: u64 = std::env::var("BIGAL_BLOCKHASH_POLL_MS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1_500);
+    let blockhash_handle = BlockhashCache::start_polling(cfg.rpc_url.clone(), bh_poll_ms);
 
-    // Start gRPC observer (if configured)
-    if let (Some(grpc_endpoint), Some(grpc_token)) = (&cfg.grpc_endpoint, &cfg.grpc_x_token) {
-        let grpc_pub = zmq_bridge::create_yellowstone_pub(&cfg.zmq_yellowstone_bind)
-            .await
-            .context("Failed to create Yellowstone ZMQ PUB socket")?;
-        let grpc_pub = Arc::new(tokio::sync::Mutex::new(grpc_pub));
+    // Pre-warm TCP+TLS connections to RPC and Jito — eliminates 100-200ms cold-start on first trade
+    {
+        let warmup_start = Instant::now();
+        let (rpc_w, rpc_read_w) = tokio::join!(
+            builder.rpc().get_health(),
+            builder.rpc_read().get_health(),
+        );
+        if let Err(e) = rpc_w { warn!("RPC warmup failed (non-fatal): {}", e); }
+        if let Err(e) = rpc_read_w { warn!("RPC-read warmup failed (non-fatal): {}", e); }
+        info!("RPC connections warmed in {:.0}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
+    }
 
+    // Start streaming observer — prefer LaserStream > Yellowstone > none.
+    // LaserStream is 4x faster, has auto-reconnect, and replaces the Node.js sidecar.
+    let streaming_zmq_pub = zmq_bridge::create_yellowstone_pub(&cfg.zmq_yellowstone_bind)
+        .await
+        .context("Failed to create streaming ZMQ PUB socket")?;
+    let streaming_zmq_pub = Arc::new(tokio::sync::Mutex::new(streaming_zmq_pub));
+
+    if let Some(ls_key) = &cfg.laserstream_api_key {
+        let ls_endpoint = cfg.laserstream_endpoint.clone()
+            .unwrap_or_else(|| "https://laserstream-mainnet-ewr.helius-rpc.com".to_string());
+        let key = ls_key.clone();
+        let program = cfg.pump_program_id.to_string();
+        let pub_sock = streaming_zmq_pub.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = grpc_observer::start_laserstream_observer(
+                    &key, &ls_endpoint, &program, pub_sock.clone(),
+                ).await {
+                    error!("LaserStream error: {} — restarting in 3s", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+            }
+        });
+        info!("Streaming: LaserStream (native Rust, replaces Node.js sidecar)");
+    } else if let (Some(grpc_endpoint), Some(grpc_token)) = (&cfg.grpc_endpoint, &cfg.grpc_x_token) {
         let endpoint = grpc_endpoint.clone();
         let token = grpc_token.clone();
         let program = cfg.pump_program_id.to_string();
+        let pub_sock = streaming_zmq_pub.clone();
 
         tokio::spawn(async move {
             loop {
                 if let Err(e) = grpc_observer::start_grpc_observer(
-                    &endpoint,
-                    &token,
-                    &program,
-                    vec![],
-                    grpc_pub.clone(),
-                )
-                .await
-                {
+                    &endpoint, &token, &program, vec![], pub_sock.clone(),
+                ).await {
                     error!("gRPC observer error: {} — reconnecting in 5s", e);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
         });
+        info!("Streaming: Yellowstone gRPC");
+    } else {
+        info!("Streaming: none (set LASERSTREAM_API_KEY or GRPC_ENDPOINT to enable)");
     }
 
     info!(
@@ -360,7 +391,7 @@ async fn handle_buy(
     let build_start = Instant::now();
 
     // Read cached blockhash for both build_buy (signing) and Jito tip tx
-    let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, 30).await;
+    let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, blockhash_max_age_secs()).await;
 
     // Build buy transaction — returns (tx, expected_tokens) for balance cache
     let (tx, tokens_out) = match builder
@@ -431,13 +462,28 @@ async fn handle_buy(
     }
 }
 
-/// Milliseconds to pause before a sell rebuild/reland after a failed attempt (RPC / blockhash settle).
-/// Set `BIGAL_SELL_RETRY_STAGGER_MS=0` to remove; default favors reliability over zero-gap retries.
+/// Milliseconds to pause before a sell land retry (default 0 — retry immediately with fresh blockhash).
 fn sell_retry_stagger_ms() -> u64 {
     std::env::var("BIGAL_SELL_RETRY_STAGGER_MS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(120)
+        .unwrap_or(0)
+}
+
+/// Milliseconds to pause before a sell build retry (default 50 — brief pause for RPC state to settle).
+fn sell_build_retry_ms() -> u64 {
+    std::env::var("BIGAL_SELL_BUILD_RETRY_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50)
+}
+
+/// Blockhash cache max age in seconds (default 40; Solana TTL ~60s).
+fn blockhash_max_age_secs() -> u64 {
+    std::env::var("BIGAL_BLOCKHASH_MAX_AGE_SEC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40)
 }
 
 /// Handle a sell signal.
@@ -513,7 +559,7 @@ async fn handle_sell(
         } else {
             None
         };
-        let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, 30).await;
+        let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, blockhash_max_age_secs()).await;
 
         let (tx, tip_blockhash) = match builder
             .build_sell(keypair, &mint, pct, signal.slippage_bps, priority_fee, cached_bal, cached_bh)
@@ -526,7 +572,7 @@ async fn handle_sell(
                         "SELL build attempt {} failed: {}, retrying fresh (no cache)",
                         attempt, e
                     );
-                    let ms = sell_retry_stagger_ms();
+                    let ms = sell_build_retry_ms();
                     if ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                     }
@@ -540,13 +586,13 @@ async fn handle_sell(
         let land_start = Instant::now();
 
         let land_result = if sell_rpc_only {
-            JitoBundler::send_via_rpc(builder.rpc(), &tx)
+            JitoBundler::send_via_rpc_fast(builder.rpc(), &tx)
                 .await
                 .map(|sig| (sig, "rpc"))
         } else {
-            // Race Jito bundle + direct RPC. Same tx signature → Solana deduplicates.
+            // Race Jito bundle + fast RPC (maxRetries=0, base64). Same tx → Solana dedupes.
             let jito_fut = bundler.submit_bundle(vec![tx.clone()], tip, keypair, tip_blockhash);
-            let rpc_fut = JitoBundler::send_via_rpc(builder.rpc(), &tx);
+            let rpc_fut = JitoBundler::send_via_rpc_fast(builder.rpc(), &tx);
             race_land_submit(jito_fut, rpc_fut, "jito", "rpc").await
         };
 

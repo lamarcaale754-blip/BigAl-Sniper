@@ -438,7 +438,7 @@ DASHBOARD_BIND_HOST = os.environ.get("DASHBOARD_BIND_HOST", "127.0.0.1").strip()
 DASHBOARD_HTML = "bigal_dashboard_customizable.html"
 
 START_PAPER_BALANCE_SOL = 10.0
-POSITION_CHECK_INTERVAL = 1.5
+POSITION_CHECK_INTERVAL = float(os.environ.get("POSITION_CHECK_INTERVAL", "0.5"))
 ENTRY_WINDOW_SEC = 10.0
 SKIP_CREATOR_AS_BUYER = True
 BC_GRADUATION_SOL = 85.0
@@ -1818,25 +1818,55 @@ async def live_buy_pump(mint, size_sol):
         keypair_b58=live_keypair_b58_for_zmq(),
     )
 
+_SELL_PERSIST_TIMEOUT = float(os.environ.get("SELL_PERSIST_TIMEOUT_SEC", "45"))
+_SELL_PERSIST_PAUSE = float(os.environ.get("SELL_PERSIST_PAUSE_SEC", "0.3"))
+
+
 async def live_sell_pump(mint, pct="100%"):
     """Execute a sell via the active executor backend.
 
-    Priority fee resolved at trade time via resolve_parameters().
+    Retries persistently until the sell confirms on chain or a wall-clock
+    timeout is reached (SELL_PERSIST_TIMEOUT_SEC, default 45s).  Each round
+    goes through the full Rust retry path (build+land × 3 internally).
+    Priority fee resolved fresh on every attempt via resolve_parameters().
     """
     if not LIVE_TX_ENABLED and MODE_LIVE:
         return True
     if executor is None:
         return False
-    sig = await resolved_sell(
-        executor,
-        mint,
-        pct,
-        _effective_sell_slippage(),
-        CONFIG,
-        adaptive_state,
-        keypair_b58=live_keypair_b58_for_zmq(),
-    )
-    return sig is not None
+
+    import time as _time
+    deadline = _time.monotonic() + _SELL_PERSIST_TIMEOUT
+    attempt = 0
+
+    while _time.monotonic() < deadline:
+        attempt += 1
+        sig = await resolved_sell(
+            executor,
+            mint,
+            pct,
+            _effective_sell_slippage(),
+            CONFIG,
+            adaptive_state,
+            keypair_b58=live_keypair_b58_for_zmq(),
+        )
+        if sig is not None:
+            if attempt > 1:
+                print(f"[SELL] Confirmed on outer attempt {attempt} for {mint[:8]}...")
+            return True
+
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+        pause = min(_SELL_PERSIST_PAUSE, remaining)
+        print(
+            f"[SELL] Rust returned None for {mint[:8]}... — retrying "
+            f"(attempt {attempt}, {remaining:.1f}s left)"
+        )
+        await asyncio.sleep(pause)
+
+    print(f"[SELL] FAILED after {attempt} outer attempts / {_SELL_PERSIST_TIMEOUT}s for {mint[:8]}...")
+    return False
 
 # =====================================================
 #  CACHE JANITOR — Periodic TTLCache pruning
