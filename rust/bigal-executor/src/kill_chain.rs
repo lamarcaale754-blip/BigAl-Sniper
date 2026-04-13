@@ -1,4 +1,3 @@
-use anyhow::Result;
 use solana_sdk::{
     pubkey::Pubkey,
     signer::keypair::Keypair,
@@ -139,24 +138,4 @@ pub async fn execute_kill(
             TradeResult::failed(signal_id, format!("{}", e))
         }
     }
-}
-
-/// RPC fallback for kill chain when Jito bundle fails — always polls fresh (no cache)
-async fn attempt_rpc_kill(
-    builder: &InstructionBuilder,
-    keypair: &Keypair,
-    mint: &Pubkey,
-) -> Result<String> {
-    let (sell_tx, _) = builder.build_sell(
-        keypair,
-        mint,
-        100.0,
-        3000,      // even more slippage for fallback
-        1_000_000, // maximum priority
-        None,      // no cached balance — poll fresh
-        None,      // no cached blockhash — fetch fresh
-    ).await?;
-
-    let sig = JitoBundler::send_via_rpc(builder.rpc(), &sell_tx).await?;
-    Ok(sig.to_string())
 }
