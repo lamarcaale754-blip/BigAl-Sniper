@@ -1,3 +1,5 @@
+mod balance_cache;
+mod blockhash_cache;
 mod config;
 mod fee_estimator;
 mod grpc_observer;
@@ -15,10 +17,12 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
+use balance_cache::BalanceCache;
+use blockhash_cache::{BlockhashCache, BlockhashHandle};
 use config::Config;
 use fee_estimator::FeeEstimator;
 use instruction_builder::InstructionBuilder;
-use jito_bundler::{JitoBundler, TipEstimator};
+use jito_bundler::{race_land_submit, JitoBundler, TipEstimator};
 use zmq_bridge::{LatencyInfo, Signal, TradeResult, ZmqBridge};
 
 use solana_sdk::signer::{keypair::Keypair, Signer};
@@ -134,33 +138,71 @@ async fn main() -> Result<()> {
         5_000, // poll every 5s (tips change slowly)
     );
 
-    // Start gRPC observer (if configured)
-    if let (Some(grpc_endpoint), Some(grpc_token)) = (&cfg.grpc_endpoint, &cfg.grpc_x_token) {
-        let grpc_pub = zmq_bridge::create_grpc_pub(cfg.zmq_grpc_port)
-            .await
-            .context("Failed to create gRPC PUB socket")?;
-        let grpc_pub = Arc::new(tokio::sync::Mutex::new(grpc_pub));
+    // Balance cache: stores expected token amounts from confirmed buys
+    // so sells can skip the RPC polling loop entirely (Phase 2)
+    let balance_cache = Arc::new(BalanceCache::new(300)); // 5-minute expiry
 
+    // Rolling blockhash pre-fetch — fresher hashes mean fewer cache misses under sell pressure
+    let bh_poll_ms: u64 = std::env::var("BIGAL_BLOCKHASH_POLL_MS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1_500);
+    let blockhash_handle = BlockhashCache::start_polling(cfg.rpc_url.clone(), bh_poll_ms);
+
+    // Pre-warm TCP+TLS connections to RPC and Jito — eliminates 100-200ms cold-start on first trade
+    {
+        let warmup_start = Instant::now();
+        let (rpc_w, rpc_read_w) = tokio::join!(
+            builder.rpc().get_health(),
+            builder.rpc_read().get_health(),
+        );
+        if let Err(e) = rpc_w { warn!("RPC warmup failed (non-fatal): {}", e); }
+        if let Err(e) = rpc_read_w { warn!("RPC-read warmup failed (non-fatal): {}", e); }
+        info!("RPC connections warmed in {:.0}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // Start streaming observer — prefer LaserStream > Yellowstone > none.
+    // LaserStream is 4x faster, has auto-reconnect, and replaces the Node.js sidecar.
+    let streaming_zmq_pub = zmq_bridge::create_yellowstone_pub(&cfg.zmq_yellowstone_bind)
+        .await
+        .context("Failed to create streaming ZMQ PUB socket")?;
+    let streaming_zmq_pub = Arc::new(tokio::sync::Mutex::new(streaming_zmq_pub));
+
+    if let Some(ls_key) = &cfg.laserstream_api_key {
+        let ls_endpoint = cfg.laserstream_endpoint.clone()
+            .unwrap_or_else(|| "https://laserstream-mainnet-ewr.helius-rpc.com".to_string());
+        let key = ls_key.clone();
+        let program = cfg.pump_program_id.to_string();
+        let pub_sock = streaming_zmq_pub.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = grpc_observer::start_laserstream_observer(
+                    &key, &ls_endpoint, &program, pub_sock.clone(),
+                ).await {
+                    error!("LaserStream error: {} — restarting in 3s", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+            }
+        });
+        info!("Streaming: LaserStream (native Rust, replaces Node.js sidecar)");
+    } else if let (Some(grpc_endpoint), Some(grpc_token)) = (&cfg.grpc_endpoint, &cfg.grpc_x_token) {
         let endpoint = grpc_endpoint.clone();
         let token = grpc_token.clone();
         let program = cfg.pump_program_id.to_string();
+        let pub_sock = streaming_zmq_pub.clone();
 
         tokio::spawn(async move {
             loop {
                 if let Err(e) = grpc_observer::start_grpc_observer(
-                    &endpoint,
-                    &token,
-                    &program,
-                    vec![],
-                    grpc_pub.clone(),
-                )
-                .await
-                {
+                    &endpoint, &token, &program, vec![], pub_sock.clone(),
+                ).await {
                     error!("gRPC observer error: {} — reconnecting in 5s", e);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
         });
+        info!("Streaming: Yellowstone gRPC");
+    } else {
+        info!("Streaming: none (set LASERSTREAM_API_KEY or GRPC_ENDPOINT to enable)");
     }
 
     info!(
@@ -202,6 +244,8 @@ async fn main() -> Result<()> {
                     &signer,
                     &fee_handle,
                     &tip_handle,
+                    &balance_cache,
+                    &blockhash_handle,
                     signal,
                     recv_time,
                 )
@@ -226,6 +270,8 @@ async fn main() -> Result<()> {
                     &signer,
                     &fee_handle,
                     &tip_handle,
+                    &balance_cache,
+                    &blockhash_handle,
                     signal,
                     recv_time,
                 )
@@ -266,6 +312,8 @@ async fn main() -> Result<()> {
                     &signer,
                     &mint,
                     tip,
+                    &balance_cache,
+                    &blockhash_handle,
                     signal.id,
                     recv_time,
                 )
@@ -322,6 +370,8 @@ async fn handle_buy(
     keypair: &solana_sdk::signer::keypair::Keypair,
     fee_handle: &Arc<std::sync::atomic::AtomicU64>,
     tip_handle: &Arc<std::sync::atomic::AtomicU64>,
+    balance_cache: &Arc<BalanceCache>,
+    blockhash_handle: &BlockhashHandle,
     signal: Signal,
     recv_time: Instant,
 ) -> TradeResult {
@@ -340,24 +390,30 @@ async fn handle_buy(
     };
     let build_start = Instant::now();
 
-    // Build buy transaction
-    let tx = match builder
-        .build_buy(keypair, &mint, signal.amount, signal.slippage_bps, priority_fee)
+    // Read cached blockhash for both build_buy (signing) and Jito tip tx
+    let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, blockhash_max_age_secs()).await;
+
+    // Build buy transaction — returns (tx, expected_tokens) for balance cache
+    let (tx, tokens_out) = match builder
+        .build_buy(keypair, &mint, signal.amount, signal.slippage_bps, priority_fee, cached_bh)
         .await
     {
-        Ok(tx) => tx,
+        Ok(pair) => pair,
         Err(e) => return TradeResult::failed(signal.id, format!("Build failed: {}", e)),
     };
 
     let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
     let land_start = Instant::now();
 
-    // Try Jito bundle first, fall back to direct RPC
-    let blockhash = match builder.rpc().get_latest_blockhash().await {
-        Ok(bh) => bh,
-        Err(e) => {
-            return TradeResult::failed(signal.id, format!("Blockhash failed: {}", e))
-        }
+    // Tip tx blockhash: reuse cached or fetch fresh
+    let blockhash = match cached_bh {
+        Some(bh) => bh,
+        None => match builder.rpc().get_latest_blockhash().await {
+            Ok(bh) => bh,
+            Err(e) => {
+                return TradeResult::failed(signal.id, format!("Blockhash failed: {}", e))
+            }
+        },
     };
 
     let base_tip = if signal.priority_fee_lamports > 0 {
@@ -367,82 +423,82 @@ async fn handle_buy(
     };
     let tip = if signal.priority == "urgent" { base_tip * 2 } else { base_tip };
 
-    match bundler
-        .submit_bundle(vec![tx.clone()], tip, keypair, blockhash)
-        .await
-    {
-        Ok(bundle_id) => {
+    // Phase 4: Race Jito + direct RPC simultaneously
+    let jito_fut = bundler.submit_bundle(vec![tx.clone()], tip, keypair, blockhash);
+    let rpc_fut = JitoBundler::send_via_rpc(builder.rpc(), &tx);
+
+    match race_land_submit(jito_fut, rpc_fut, "jito", "rpc").await {
+        Ok((sig_or_id, method)) => {
             let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
 
+            // Cache expected token balance for fast sell
+            balance_cache.insert(mint, tokens_out);
+
+            let tip_used = if method == "jito" { tip } else { 0 };
             info!(
-                "BUY confirmed via Jito | mint={} | {:.3} SOL | fee={} tip={} | bundle={} | total={:.0}ms",
-                signal.mint, signal.amount, priority_fee, tip, bundle_id, total_ms
+                "BUY confirmed via {} | mint={} | {:.3} SOL | ~{} tokens cached | fee={} tip={} | {} | total={:.0}ms",
+                method, signal.mint, signal.amount, tokens_out, priority_fee, tip_used, sig_or_id, total_ms
             );
 
             TradeResult::confirmed(
                 signal.id,
-                bundle_id,
-                "jito".to_string(),
+                sig_or_id,
+                method.to_string(),
                 LatencyInfo {
                     zmq_recv_ms,
                     build_ms,
                     land_ms,
                     total_ms,
                     fee_used_lamports: priority_fee,
-                    tip_used_lamports: tip,
+                    tip_used_lamports: tip_used,
                 },
             )
         }
-        Err(jito_err) => {
-            warn!("Jito failed ({}), trying direct RPC...", jito_err);
-
-            match JitoBundler::send_via_rpc(builder.rpc(), &tx).await {
-                Ok(sig) => {
-                    let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
-                    let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
-
-                    info!(
-                        "BUY confirmed via RPC | mint={} | {:.3} SOL | sig={} | total={:.0}ms",
-                        signal.mint, signal.amount, sig, total_ms
-                    );
-
-                    TradeResult::confirmed(
-                        signal.id,
-                        sig.to_string(),
-                        "rpc".to_string(),
-                        LatencyInfo {
-                            zmq_recv_ms,
-                            build_ms,
-                            land_ms,
-                            total_ms,
-                            fee_used_lamports: priority_fee,
-                            tip_used_lamports: 0,
-                        },
-                    )
-                }
-                Err(rpc_err) => {
-                    error!("BUY FAILED | jito: {} | rpc: {}", jito_err, rpc_err);
-                    TradeResult::failed(
-                        signal.id,
-                        format!("jito: {} | rpc: {}", jito_err, rpc_err),
-                    )
-                }
-            }
+        Err(e) => {
+            error!("BUY FAILED | {}", e);
+            TradeResult::failed(signal.id, format!("{}", e))
         }
     }
+}
+
+/// Milliseconds to pause before a sell land retry (default 0 — retry immediately with fresh blockhash).
+fn sell_retry_stagger_ms() -> u64 {
+    std::env::var("BIGAL_SELL_RETRY_STAGGER_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Milliseconds to pause before a sell build retry (default 50 — brief pause for RPC state to settle).
+fn sell_build_retry_ms() -> u64 {
+    std::env::var("BIGAL_SELL_BUILD_RETRY_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50)
+}
+
+/// Blockhash cache max age in seconds (default 40; Solana TTL ~60s).
+fn blockhash_max_age_secs() -> u64 {
+    std::env::var("BIGAL_BLOCKHASH_MAX_AGE_SEC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40)
 }
 
 /// Handle a sell signal.
 ///
 /// Tip tx uses the same recent blockhash as the signed sell (see [`InstructionBuilder::build_sell`]).
-/// Up to two full rebuild+land rounds for transient failures.
+/// Up to three rebuild+land rounds; optional short stagger between attempts (see [`sell_retry_stagger_ms`]).
+/// Attempt 1 uses balance cache + blockhash cache; later attempts poll fresh.
 async fn handle_sell(
     builder: &InstructionBuilder,
     bundler: &JitoBundler,
     keypair: &solana_sdk::signer::keypair::Keypair,
     fee_handle: &Arc<std::sync::atomic::AtomicU64>,
     tip_handle: &Arc<std::sync::atomic::AtomicU64>,
+    balance_cache: &Arc<BalanceCache>,
+    blockhash_handle: &BlockhashHandle,
     signal: Signal,
     recv_time: Instant,
 ) -> TradeResult {
@@ -453,13 +509,32 @@ async fn handle_sell(
         Err(e) => return TradeResult::failed(signal.id, format!("Invalid mint: {}", e)),
     };
 
-    let priority_fee = if signal.priority_fee_lamports > 0 {
+    let mut priority_fee = if signal.priority_fee_lamports > 0 {
         signal.priority_fee_lamports
     } else {
         fee_handle.load(Ordering::Relaxed)
     };
+    // Optional extra micro-lamports on urgent sells (default off = strategy/Python fee only).
+    if signal.priority == "urgent" {
+        let bps: u128 = std::env::var("BIGAL_SELL_PRIORITY_MULT_BPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
+        if bps > 0 && bps != 10_000 {
+            priority_fee = ((priority_fee as u128).saturating_mul(bps) / 10_000).min(u64::MAX as u128) as u64;
+        }
+    }
 
     let pct = signal.amount;
+
+    let sell_rpc_only = std::env::var("BIGAL_SELL_RPC_ONLY")
+        .map(|v| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
 
     let base_tip = if signal.priority_fee_lamports > 0 {
         signal.priority_fee_lamports
@@ -474,21 +549,33 @@ async fn handle_sell(
 
     let mut last_failure = String::new();
 
-    for attempt in 1..=2u8 {
+    for attempt in 1..=3u8 {
         let build_start = Instant::now();
 
+        // Attempt 1: use balance cache + blockhash cache for maximum speed
+        // Attempt 2: force fresh RPC polls (cache may have been wrong)
+        let cached_bal = if attempt == 1 {
+            balance_cache.get(&mint)
+        } else {
+            None
+        };
+        let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, blockhash_max_age_secs()).await;
+
         let (tx, tip_blockhash) = match builder
-            .build_sell(keypair, &mint, pct, signal.slippage_bps, priority_fee)
+            .build_sell(keypair, &mint, pct, signal.slippage_bps, priority_fee, cached_bal, cached_bh)
             .await
         {
             Ok(x) => x,
             Err(e) => {
-                if attempt < 2 {
+                if attempt < 3 {
                     warn!(
-                        "SELL build attempt {} failed: {}, retrying after 250ms",
+                        "SELL build attempt {} failed: {}, retrying fresh (no cache)",
                         attempt, e
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    let ms = sell_build_retry_ms();
+                    if ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
                     continue;
                 }
                 return TradeResult::failed(signal.id, format!("Build failed: {}", e));
@@ -498,71 +585,53 @@ async fn handle_sell(
         let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
         let land_start = Instant::now();
 
-        match bundler
-            .submit_bundle(vec![tx.clone()], tip, keypair, tip_blockhash)
-            .await
-        {
-            Ok(bundle_id) => {
+        let land_result = if sell_rpc_only {
+            JitoBundler::send_via_rpc_fast(builder.rpc(), &tx)
+                .await
+                .map(|sig| (sig, "rpc"))
+        } else {
+            // Race Jito bundle + fast RPC (maxRetries=0, base64). Same tx → Solana dedupes.
+            let jito_fut = bundler.submit_bundle(vec![tx.clone()], tip, keypair, tip_blockhash);
+            let rpc_fut = JitoBundler::send_via_rpc_fast(builder.rpc(), &tx);
+            race_land_submit(jito_fut, rpc_fut, "jito", "rpc").await
+        };
+
+        match land_result {
+            Ok((sig_or_id, method)) => {
                 let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
 
+                balance_cache.remove(&mint);
+
+                let tip_used = if method == "jito" { tip } else { 0 };
                 info!(
-                    "SELL confirmed via Jito | mint={} | {}% | fee={} tip={} | bundle={} | total={:.0}ms | attempt={}",
-                    signal.mint, pct, priority_fee, tip, bundle_id, total_ms, attempt
+                    "SELL confirmed via {} | mint={} | {}% | fee={} tip={} | {} | total={:.0}ms | attempt={}",
+                    method, signal.mint, pct, priority_fee, tip_used, sig_or_id, total_ms, attempt
                 );
 
                 return TradeResult::confirmed(
                     signal.id,
-                    bundle_id,
-                    "jito".to_string(),
+                    sig_or_id,
+                    method.to_string(),
                     LatencyInfo {
                         zmq_recv_ms,
                         build_ms,
                         land_ms,
                         total_ms,
                         fee_used_lamports: priority_fee,
-                        tip_used_lamports: tip,
+                        tip_used_lamports: tip_used,
                     },
                 );
             }
-            Err(jito_err) => {
-                warn!(
-                    "Jito failed ({}) attempt {}, trying direct RPC...",
-                    jito_err, attempt
-                );
-
-                match JitoBundler::send_via_rpc(builder.rpc(), &tx).await {
-                    Ok(sig) => {
-                        let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
-                        let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
-
-                        info!(
-                            "SELL confirmed via RPC | mint={} | {}% | sig={} | total={:.0}ms | attempt={}",
-                            signal.mint, pct, sig, total_ms, attempt
-                        );
-
-                        return TradeResult::confirmed(
-                            signal.id,
-                            sig.to_string(),
-                            "rpc".to_string(),
-                            LatencyInfo {
-                                zmq_recv_ms,
-                                build_ms,
-                                land_ms,
-                                total_ms,
-                                fee_used_lamports: priority_fee,
-                                tip_used_lamports: 0,
-                            },
-                        );
+            Err(e) => {
+                last_failure = format!("{}", e);
+                error!("SELL land failed attempt {} | {}", attempt, last_failure);
+                if attempt < 3 {
+                    let ms = sell_retry_stagger_ms();
+                    if ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                     }
-                    Err(rpc_err) => {
-                        last_failure = format!("jito: {} | rpc: {}", jito_err, rpc_err);
-                        error!("SELL land failed attempt {} | {}", attempt, last_failure);
-                        if attempt < 2 {
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            continue;
-                        }
-                    }
+                    continue;
                 }
             }
         }

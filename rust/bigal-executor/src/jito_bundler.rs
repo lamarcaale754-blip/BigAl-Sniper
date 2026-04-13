@@ -31,6 +31,9 @@ const FALLBACK_TIP_ACCOUNTS: &[&str] = &[
 /// avoiding complex protobuf dependencies.
 pub struct JitoBundler {
     bundle_url: String,
+    /// Optional secondary Jito endpoint for geographic redundancy.
+    /// When set, `submit_bundle` races both endpoints simultaneously.
+    secondary_bundle_url: Option<String>,
     tip_accounts: Vec<Pubkey>,
     http: reqwest::Client,
 }
@@ -44,18 +47,43 @@ impl JitoBundler {
             format!("{}/api/v1/bundles", block_engine_url.trim_end_matches('/'))
         };
 
+        // Check for secondary Jito endpoint (multi-region redundancy)
+        let secondary_bundle_url = std::env::var("JITO_BLOCK_ENGINE_SECONDARY")
+            .ok()
+            .map(|url| {
+                if url.ends_with("/api/v1/bundles") {
+                    url
+                } else {
+                    format!("{}/api/v1/bundles", url.trim_end_matches('/'))
+                }
+            });
+
         // Initialize with fallback tip accounts
         let tip_accounts: Vec<Pubkey> = FALLBACK_TIP_ACCOUNTS
             .iter()
             .filter_map(|s| Pubkey::from_str(s).ok())
             .collect();
 
-        info!("JitoBundler initialized | url={} | tip_accounts={}", bundle_url, tip_accounts.len());
+        if let Some(ref sec) = secondary_bundle_url {
+            info!("JitoBundler initialized | primary={} | secondary={} | tip_accounts={}", bundle_url, sec, tip_accounts.len());
+        } else {
+            info!("JitoBundler initialized | url={} | tip_accounts={}", bundle_url, tip_accounts.len());
+        }
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(4))
+            .tcp_keepalive(Duration::from_secs(20))
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("reqwest client build (Jito)");
 
         JitoBundler {
             bundle_url,
+            secondary_bundle_url,
             tip_accounts,
-            http: reqwest::Client::new(),
+            http,
         }
     }
 
@@ -131,6 +159,8 @@ impl JitoBundler {
     /// Submit a bundle of transactions to Jito block engine.
     ///
     /// The bundle includes all provided transactions plus a tip transaction.
+    /// When a secondary endpoint is configured (JITO_BLOCK_ENGINE_SECONDARY),
+    /// races both endpoints simultaneously — first success wins.
     /// Returns the bundle UUID on success.
     pub async fn submit_bundle(
         &self,
@@ -156,7 +186,7 @@ impl JitoBundler {
 
         debug!("Submitting Jito bundle: {} txs + tip ({} lamports)", transactions.len(), tip_lamports);
 
-        // Submit via JSON-RPC
+        // Build JSON-RPC request (shared by both endpoints)
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -164,16 +194,74 @@ impl JitoBundler {
             "params": [encoded_txs]
         });
 
+        // Multi-region: race primary + secondary if configured
+        if let Some(ref secondary_url) = self.secondary_bundle_url {
+            let primary_fut = self.post_bundle(&self.bundle_url, &request);
+            let secondary_fut = self.post_bundle(secondary_url, &request);
+            tokio::pin!(primary_fut);
+            tokio::pin!(secondary_fut);
+
+            tokio::select! {
+                primary_result = &mut primary_fut => {
+                    match primary_result {
+                        Ok(id) => {
+                            info!("Jito bundle submitted (primary): {}", id);
+                            Ok(id)
+                        }
+                        Err(primary_err) => {
+                            warn!("Jito primary failed ({}), awaiting secondary...", primary_err);
+                            match secondary_fut.await {
+                                Ok(id) => {
+                                    info!("Jito bundle submitted (secondary): {}", id);
+                                    Ok(id)
+                                }
+                                Err(sec_err) => {
+                                    Err(anyhow::anyhow!("primary: {} | secondary: {}", primary_err, sec_err))
+                                }
+                            }
+                        }
+                    }
+                }
+                secondary_result = &mut secondary_fut => {
+                    match secondary_result {
+                        Ok(id) => {
+                            info!("Jito bundle submitted (secondary won): {}", id);
+                            Ok(id)
+                        }
+                        Err(sec_err) => {
+                            warn!("Jito secondary failed ({}), awaiting primary...", sec_err);
+                            match primary_fut.await {
+                                Ok(id) => {
+                                    info!("Jito bundle submitted (primary): {}", id);
+                                    Ok(id)
+                                }
+                                Err(primary_err) => {
+                                    Err(anyhow::anyhow!("primary: {} | secondary: {}", primary_err, sec_err))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Single endpoint
+            let bundle_id = self.post_bundle(&self.bundle_url, &request).await?;
+            info!("Jito bundle submitted: {}", bundle_id);
+            Ok(bundle_id)
+        }
+    }
+
+    /// Post a bundle to a single Jito endpoint and return the bundle UUID.
+    async fn post_bundle(&self, url: &str, request: &serde_json::Value) -> Result<String> {
         let resp = self.http
-            .post(&self.bundle_url)
-            .json(&request)
+            .post(url)
+            .json(request)
             .send()
             .await
             .context("Jito bundle submission failed")?
             .json::<serde_json::Value>()
             .await?;
 
-        // Check for errors
         if let Some(err) = resp.get("error") {
             let err_msg = err.get("message")
                 .and_then(|m| m.as_str())
@@ -181,13 +269,11 @@ impl JitoBundler {
             anyhow::bail!("Jito bundle rejected: {}", err_msg);
         }
 
-        // Extract bundle UUID
         let bundle_id = resp["result"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("No bundle ID in Jito response"))?
             .to_string();
 
-        info!("Jito bundle submitted: {}", bundle_id);
         Ok(bundle_id)
     }
 
@@ -224,9 +310,78 @@ impl JitoBundler {
         rpc: &crate::rpc::RpcClient,
         tx: &Transaction,
     ) -> Result<String> {
-        rpc.send_and_confirm_transaction(tx).await
+        rpc.send_transaction(tx).await
             .context("RPC send_and_confirm failed")
     }
+
+    /// Fast RPC path for time-critical sells: maxRetries=0, base64 encoding.
+    pub async fn send_via_rpc_fast(
+        rpc: &crate::rpc::RpcClient,
+        tx: &Transaction,
+    ) -> Result<String> {
+        rpc.send_transaction_fast(tx).await
+            .context("RPC send_transaction_fast failed")
+    }
+}
+
+/// Race Jito bundle submission against direct RPC; same signed tx → chain dedupes.
+///
+/// `jito_method` / `rpc_method` are returned to Python (e.g. `"jito"` vs `"rpc"`, or
+/// `"jito_kill"` / `"rpc_kill"` for kill chain).
+///
+/// Bounded by `BIGAL_LAND_TIMEOUT_SEC` (default 8). Uses `biased` polling so RPC is
+/// checked first when both complete — more `rpc` wins when timings are similar.
+pub async fn race_land_submit(
+    jito_fut: impl std::future::Future<Output = Result<String>> + Send,
+    rpc_fut: impl std::future::Future<Output = Result<String>> + Send,
+    jito_method: &'static str,
+    rpc_method: &'static str,
+) -> Result<(String, &'static str)> {
+    let secs: u64 = std::env::var("BIGAL_LAND_TIMEOUT_SEC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let land_deadline = Duration::from_secs(secs);
+
+    tokio::time::timeout(land_deadline, async {
+        tokio::pin!(jito_fut);
+        tokio::pin!(rpc_fut);
+
+        tokio::select! {
+            biased;
+            rpc_result = &mut rpc_fut => {
+                match rpc_result {
+                    Ok(sig) => Ok((sig, rpc_method)),
+                    Err(rpc_err) => {
+                        warn!("RPC lost race ({}), awaiting Jito...", rpc_err);
+                        match jito_fut.await {
+                            Ok(id) => Ok((id, jito_method)),
+                            Err(jito_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
+                        }
+                    }
+                }
+            }
+            jito_result = &mut jito_fut => {
+                match jito_result {
+                    Ok(id) => Ok((id, jito_method)),
+                    Err(jito_err) => {
+                        warn!("Jito lost race ({}), awaiting RPC...", jito_err);
+                        match rpc_fut.await {
+                            Ok(sig) => Ok((sig, rpc_method)),
+                            Err(rpc_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Jito+RPC land timed out after {}s (raise BIGAL_LAND_TIMEOUT_SEC or ZMQ_SELL_WAIT_SEC if needed)",
+            secs
+        )
+    })?
 }
 
 // ─────────────────────────────────────────────

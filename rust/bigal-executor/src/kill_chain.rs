@@ -1,13 +1,15 @@
-use anyhow::Result;
 use solana_sdk::{
     pubkey::Pubkey,
     signer::keypair::Keypair,
 };
+use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
+use crate::balance_cache::BalanceCache;
+use crate::blockhash_cache::{self, BlockhashHandle};
 use crate::instruction_builder::InstructionBuilder;
-use crate::jito_bundler::JitoBundler;
+use crate::jito_bundler::{race_land_submit, JitoBundler};
 use crate::zmq_bridge::{LatencyInfo, TradeResult};
 
 /// Execute an atomic rug pull via Jito bundle.
@@ -27,6 +29,8 @@ pub async fn execute_kill(
     keypair: &Keypair,
     mint: &Pubkey,
     tip_lamports: u64,
+    balance_cache: &Arc<BalanceCache>,
+    blockhash_handle: &BlockhashHandle,
     signal_id: String,
     recv_time: Instant,
 ) -> TradeResult {
@@ -39,6 +43,12 @@ pub async fn execute_kill(
 
     let build_start = Instant::now();
 
+    // Use caches for maximum speed on kill chain
+    let cached_bal = balance_cache.get(mint);
+    let max_age: u64 = std::env::var("BIGAL_BLOCKHASH_MAX_AGE_SEC")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, max_age).await;
+
     // Step 1: Build sell-all transaction (100% of holdings) + blockhash aligned with sell signature
     let (sell_tx, tip_blockhash) = match builder.build_sell(
         keypair,
@@ -46,6 +56,8 @@ pub async fn execute_kill(
         100.0,         // sell everything
         2000,          // 20% slippage (aggressive for kills — we want it to land)
         500_000,       // high priority fee
+        cached_bal,
+        cached_bh,
     ).await {
         Ok(pair) => pair,
         Err(e) => {
@@ -57,87 +69,48 @@ pub async fn execute_kill(
     let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
     let land_start = Instant::now();
 
-    // Step 2: Submit as atomic Jito bundle (sell + tip; tip uses same recent blockhash as sell)
-    match bundler.submit_bundle(
-        vec![sell_tx],
+    // Step 2: Race Jito bundle + direct RPC simultaneously for maximum kill speed.
+    // Same signed tx → Solana deduplicates. First to land wins.
+    let jito_fut = bundler.submit_bundle(
+        vec![sell_tx.clone()],
         tip_lamports,
         keypair,
         tip_blockhash,
-    ).await {
-        Ok(bundle_id) => {
+    );
+    let rpc_fut = JitoBundler::send_via_rpc(builder.rpc(), &sell_tx);
+
+    let submission_result = race_land_submit(jito_fut, rpc_fut, "jito_kill", "rpc_kill").await;
+
+    match submission_result {
+        Ok((sig_or_id, method)) => {
             let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
 
+            balance_cache.remove(mint);
+
+            let tip_used = if method == "jito_kill" { tip_lamports } else { 0 };
             info!(
-                "KILL CHAIN SUCCESS | bundle={} | build={:.0}ms land={:.0}ms total={:.0}ms",
-                bundle_id, build_ms, land_ms, total_ms
+                "KILL CHAIN SUCCESS via {} | {} | build={:.0}ms land={:.0}ms total={:.0}ms",
+                method, sig_or_id, build_ms, land_ms, total_ms
             );
 
             TradeResult::confirmed(
                 signal_id,
-                bundle_id,
-                "jito_kill".to_string(),
+                sig_or_id,
+                method.to_string(),
                 LatencyInfo {
                     zmq_recv_ms,
                     build_ms,
                     land_ms,
                     total_ms,
                     fee_used_lamports: 500_000,
-                    tip_used_lamports: tip_lamports,
+                    tip_used_lamports: tip_used,
                 },
             )
         }
         Err(e) => {
-            warn!("Kill chain Jito submit failed, attempting direct RPC: {}", e);
-
-            // Fallback: rebuild and send via direct RPC
-            match attempt_rpc_kill(builder, keypair, mint).await {
-                Ok(sig) => {
-                    let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
-                    let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
-
-                    warn!("Kill chain landed via RPC fallback: {}", sig);
-
-                    TradeResult::confirmed(
-                        signal_id,
-                        sig,
-                        "rpc_kill_fallback".to_string(),
-                        LatencyInfo {
-                            zmq_recv_ms,
-                            build_ms,
-                            land_ms,
-                            total_ms,
-                            fee_used_lamports: 1_000_000,
-                            tip_used_lamports: 0,
-                        },
-                    )
-                }
-                Err(rpc_err) => {
-                    error!("Kill chain FAILED (both Jito and RPC): {} / {}", e, rpc_err);
-                    TradeResult::failed(
-                        signal_id,
-                        format!("jito: {} | rpc: {}", e, rpc_err),
-                    )
-                }
-            }
+            error!("Kill chain FAILED (both Jito and RPC): {}", e);
+            TradeResult::failed(signal_id, format!("{}", e))
         }
     }
-}
-
-/// RPC fallback for kill chain when Jito bundle fails
-async fn attempt_rpc_kill(
-    builder: &InstructionBuilder,
-    keypair: &Keypair,
-    mint: &Pubkey,
-) -> Result<String> {
-    let (sell_tx, _) = builder.build_sell(
-        keypair,
-        mint,
-        100.0,
-        3000,      // even more slippage for fallback
-        1_000_000, // maximum priority
-    ).await?;
-
-    let sig = JitoBundler::send_via_rpc(builder.rpc(), &sell_tx).await?;
-    Ok(sig.to_string())
 }

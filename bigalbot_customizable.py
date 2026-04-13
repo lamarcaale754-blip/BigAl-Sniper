@@ -279,6 +279,8 @@ CONFIG = {
     "min_pool": 0.3,
     # Risk
     "max_positions": 10, "trade_size": 0.05,
+    # Rust executor sell min-out (percent). Wider = fewer reverts on fast dumps; max 35.
+    "rust_sell_slippage_pct": 18,
     "cooldown_losses": 8, "cooldown_sec": 10.0,
     # Moonbag
     "moonbag_pct": 10.0, "moonbag_expire": 120.0,
@@ -436,7 +438,7 @@ DASHBOARD_BIND_HOST = os.environ.get("DASHBOARD_BIND_HOST", "127.0.0.1").strip()
 DASHBOARD_HTML = "bigal_dashboard_customizable.html"
 
 START_PAPER_BALANCE_SOL = 10.0
-POSITION_CHECK_INTERVAL = 1.5
+POSITION_CHECK_INTERVAL = float(os.environ.get("POSITION_CHECK_INTERVAL", "0.5"))
 ENTRY_WINDOW_SEC = 10.0
 SKIP_CREATOR_AS_BUYER = True
 BC_GRADUATION_SOL = 85.0
@@ -447,12 +449,22 @@ MIN_SYMBOL_LENGTH = 2
 MAX_SYMBOL_LENGTH = 10
 
 PUMPPORTAL_TRADE_LOCAL = "https://pumpportal.fun/api/trade-local"
+# Buys: tight min-out is fine (you control size). Sells: curve moves during the hold — 3% sell
+# slippage caused mass Rust sell reverts + Legacy fallback (15% there masked the issue).
 PUMP_SLIPPAGE_PCT_BY_MODE = {"zmq_rust": 3, "legacy": 15, "paper": 10}
 
 def _effective_slippage() -> int:
-    """Return slippage % for the current executor mode.
-    Jito bundles (zmq_rust) can't be sandwiched → tight 3%.
-    Legacy HTTP is unprotected → needs 15% buffer."""
+    """Return slippage % for BUYS in the current executor mode."""
+    return PUMP_SLIPPAGE_PCT_BY_MODE.get(EXECUTOR_MODE, 10)
+
+
+def _effective_sell_slippage() -> int:
+    """Return slippage % for SELLS. Rust path needs a wide min-SOL-out like competitive bots."""
+    if EXECUTOR_MODE == "zmq_rust":
+        v = CONFIG.get("rust_sell_slippage_pct")
+        if v is not None:
+            return max(5, min(35, int(v)))
+        return 18
     return PUMP_SLIPPAGE_PCT_BY_MODE.get(EXECUTOR_MODE, 10)
 
 PUMP_PRIORITY_FEE_SOL = 0.002
@@ -1806,25 +1818,55 @@ async def live_buy_pump(mint, size_sol):
         keypair_b58=live_keypair_b58_for_zmq(),
     )
 
+_SELL_PERSIST_TIMEOUT = float(os.environ.get("SELL_PERSIST_TIMEOUT_SEC", "45"))
+_SELL_PERSIST_PAUSE = float(os.environ.get("SELL_PERSIST_PAUSE_SEC", "0.3"))
+
+
 async def live_sell_pump(mint, pct="100%"):
     """Execute a sell via the active executor backend.
 
-    Priority fee resolved at trade time via resolve_parameters().
+    Retries persistently until the sell confirms on chain or a wall-clock
+    timeout is reached (SELL_PERSIST_TIMEOUT_SEC, default 45s).  Each round
+    goes through the full Rust retry path (build+land × 3 internally).
+    Priority fee resolved fresh on every attempt via resolve_parameters().
     """
     if not LIVE_TX_ENABLED and MODE_LIVE:
         return True
     if executor is None:
         return False
-    sig = await resolved_sell(
-        executor,
-        mint,
-        pct,
-        _effective_slippage(),
-        CONFIG,
-        adaptive_state,
-        keypair_b58=live_keypair_b58_for_zmq(),
-    )
-    return sig is not None
+
+    import time as _time
+    deadline = _time.monotonic() + _SELL_PERSIST_TIMEOUT
+    attempt = 0
+
+    while _time.monotonic() < deadline:
+        attempt += 1
+        sig = await resolved_sell(
+            executor,
+            mint,
+            pct,
+            _effective_sell_slippage(),
+            CONFIG,
+            adaptive_state,
+            keypair_b58=live_keypair_b58_for_zmq(),
+        )
+        if sig is not None:
+            if attempt > 1:
+                print(f"[SELL] Confirmed on outer attempt {attempt} for {mint[:8]}...")
+            return True
+
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+        pause = min(_SELL_PERSIST_PAUSE, remaining)
+        print(
+            f"[SELL] Rust returned None for {mint[:8]}... — retrying "
+            f"(attempt {attempt}, {remaining:.1f}s left)"
+        )
+        await asyncio.sleep(pause)
+
+    print(f"[SELL] FAILED after {attempt} outer attempts / {_SELL_PERSIST_TIMEOUT}s for {mint[:8]}...")
+    return False
 
 # =====================================================
 #  CACHE JANITOR — Periodic TTLCache pruning

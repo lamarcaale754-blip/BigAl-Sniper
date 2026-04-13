@@ -33,6 +33,9 @@ pub const DEFAULT_JITO_BUNDLE_URL: &str = "https://ny.mainnet.block-engine.jito.
 pub const DEFAULT_ZMQ_SIGNAL_IPC: &str = "ipc:///tmp/bigal_signal.ipc";
 pub const DEFAULT_ZMQ_RESULT_IPC: &str = "ipc:///tmp/bigal_result.ipc";
 
+/// Rust Yellowstone → Python SUB (must match `ZMQ_YELLOWSTONE_IPC` in bigalbot on Unix)
+pub const DEFAULT_ZMQ_YELLOWSTONE_IPC: &str = "ipc:///tmp/bigal_yellowstone.ipc";
+
 /// Default Jito tip (5000 lamports = 0.000005 SOL)
 pub const DEFAULT_JITO_TIP_LAMPORTS: u64 = 5_000_000; // 0.005 SOL
 
@@ -54,6 +57,12 @@ pub struct Config {
     /// gRPC auth token
     pub grpc_x_token: Option<String>,
 
+    /// Helius LaserStream API key (`HELIUS_API_KEY` or `LASERSTREAM_API_KEY`)
+    pub laserstream_api_key: Option<String>,
+
+    /// LaserStream endpoint (default: US-East EWR)
+    pub laserstream_endpoint: Option<String>,
+
     /// Jito block engine URL
     pub jito_block_engine: String,
 
@@ -66,8 +75,11 @@ pub struct Config {
     /// ZMQ result port (Rust PUB → Python SUB)
     pub zmq_result_port: u16,
 
-    /// ZMQ gRPC forward port (Rust PUB → Python SUB for gRPC events)
+    /// ZMQ gRPC forward port (Rust PUB → Python SUB for gRPC events, Windows TCP fallback)
     pub zmq_grpc_port: u16,
+
+    /// Bind address for Rust Yellowstone PUB (`ZMQ_YELLOWSTONE_IPC` or Unix default IPC / Windows TCP)
+    pub zmq_yellowstone_bind: String,
 
     /// ZMQ signal endpoint (Rust PULL connects — Python PUSH binds here)
     pub zmq_signal_addr: String,
@@ -106,6 +118,12 @@ impl Config {
         let grpc_endpoint = env::var("GRPC_ENDPOINT").ok().filter(|s| !s.is_empty());
         let grpc_x_token = env::var("GRPC_X_TOKEN").ok().filter(|s| !s.is_empty());
 
+        let laserstream_api_key = env::var("LASERSTREAM_API_KEY")
+            .or_else(|_| env::var("HELIUS_API_KEY"))
+            .ok()
+            .filter(|s| !s.is_empty());
+        let laserstream_endpoint = env::var("LASERSTREAM_ENDPOINT").ok().filter(|s| !s.is_empty());
+
         let jito_block_engine = env::var("JITO_BLOCK_ENGINE")
             .unwrap_or_else(|_| DEFAULT_JITO_BLOCK_ENGINE.to_string());
         let jito_bundle_url = env::var("JITO_BUNDLE_URL")
@@ -123,6 +141,17 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5557);
+
+        let zmq_yellowstone_bind = env::var("ZMQ_YELLOWSTONE_IPC").unwrap_or_else(|_| {
+            #[cfg(unix)]
+            {
+                DEFAULT_ZMQ_YELLOWSTONE_IPC.to_string()
+            }
+            #[cfg(not(unix))]
+            {
+                format!("tcp://127.0.0.1:{}", zmq_grpc_port)
+            }
+        });
 
         let (zmq_signal_addr, zmq_result_addr) = resolve_zmq_endpoints(zmq_signal_port, zmq_result_port);
 
@@ -150,11 +179,14 @@ impl Config {
             keypair,
             grpc_endpoint,
             grpc_x_token,
+            laserstream_api_key,
+            laserstream_endpoint,
             jito_block_engine,
             jito_bundle_url,
             zmq_signal_port,
             zmq_result_port,
             zmq_grpc_port,
+            zmq_yellowstone_bind,
             zmq_signal_addr,
             zmq_result_addr,
             pump_program_id,

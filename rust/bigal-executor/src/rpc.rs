@@ -9,6 +9,7 @@ use solana_sdk::{
     pubkey::Pubkey,
     transaction::Transaction,
 };
+use std::time::Duration;
 use tracing::debug;
 
 pub struct RpcClient {
@@ -18,9 +19,22 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn new(url: &str) -> Self {
+        let req_timeout: u64 = std::env::var("BIGAL_RPC_TIMEOUT_SEC")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+        let conn_timeout: u64 = std::env::var("BIGAL_RPC_CONNECT_TIMEOUT_SEC")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(req_timeout))
+            .connect_timeout(Duration::from_secs(conn_timeout))
+            .tcp_keepalive(Duration::from_secs(20))
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(4)
+            .build()
+            .expect("reqwest client build");
         RpcClient {
             url: url.to_string(),
-            http: reqwest::Client::new(),
+            http,
         }
     }
 
@@ -144,8 +158,11 @@ impl RpcClient {
             .ok_or_else(|| anyhow::anyhow!("Invalid balance response"))
     }
 
-    /// Send a signed transaction and wait for confirmation
-    pub async fn send_and_confirm_transaction(&self, tx: &Transaction) -> Result<String> {
+    /// Broadcast a signed transaction via `sendTransaction` (skipPreflight, maxRetries=3).
+    ///
+    /// Returns the signature on RPC acceptance. This does **not** poll for
+    /// confirmation — the name is kept short for call-site readability.
+    pub async fn send_transaction(&self, tx: &Transaction) -> Result<String> {
         let tx_bytes = bincode::serialize(tx)
             .context("Failed to serialize transaction")?;
         let encoded = bs58::encode(&tx_bytes).into_string();
@@ -167,5 +184,40 @@ impl RpcClient {
 
         debug!("TX sent: {}", sig);
         Ok(sig)
+    }
+
+    /// Fastest possible transaction broadcast for time-critical sells.
+    ///
+    /// * `maxRetries: 0` — bot retries with fresh blockhash, not stale server retries.
+    /// * `base64` encoding — faster than base58 serialization.
+    pub async fn send_transaction_fast(&self, tx: &Transaction) -> Result<String> {
+        let tx_bytes = bincode::serialize(tx)
+            .context("Failed to serialize transaction")?;
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+
+        let result = self.call("sendTransaction", serde_json::json!([
+            encoded,
+            {
+                "encoding": "base64",
+                "skipPreflight": true,
+                "preflightCommitment": "processed",
+                "maxRetries": 0
+            }
+        ])).await?;
+
+        let sig = result
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("No signature in sendTransaction response"))?
+            .to_string();
+
+        debug!("TX sent (fast): {}", sig);
+        Ok(sig)
+    }
+
+    /// Lightweight health check for connection warmup.
+    pub async fn get_health(&self) -> Result<()> {
+        let _ = self.call("getHealth", serde_json::json!([])).await;
+        Ok(())
     }
 }

@@ -2,50 +2,47 @@
 name = "bigal-executor"
 version = "0.1.0"
 edition = "2021"
-description = "Low-latency Solana trade executor for BigAl Sniper — Pump.fun instructions, Jito bundles, Yellowstone gRPC"
+description = "Low-latency Solana trade executor for BigAl Sniper — Pump.fun instructions, Jito bundles"
 
 [features]
 default = []
-# gRPC feature disabled until yellowstone-grpc-proto is compatible with solana-sdk 4.x
+# Yellowstone Geyser (optional). See ../GRPC_RESOURCES.md — uncomment deps + line below when ready.
 # grpc = ["yellowstone-grpc-client", "yellowstone-grpc-proto", "tonic", "prost", "futures"]
+# Helius LaserStream — 4x faster than Yellowstone, auto-reconnect, zero data loss.
+# Replaces the Node.js sidecar entirely.  Build on Linux production server:
+#   cargo build --release --features laserstream
+# (Windows: protobuf-src build dep needs autotools; use the Node.js sidecar instead.)
+laserstream = ["helius-laserstream", "futures"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("grpc", "laserstream"))'] }
 
 [dependencies]
-# Async runtime
 tokio = { version = "1", features = ["full"] }
-
-# Solana core (4.x stable — types, signing, transactions)
 solana-sdk = "4"
 spl-token = "9"
 spl-associated-token-account = "8"
-
-# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 borsh = { version = "1", features = ["derive"] }
 bincode = "1"
 bs58 = "0.5"
-
-# ZeroMQ — pure Rust, no C deps needed on Windows
 zeromq = "0.4"
-
-# HTTP client (for RPC, Jito API, fee estimation)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-
-# gRPC (Yellowstone Geyser) — temporarily removed due to solana-sdk 4.x incompatibility
-# Re-add when yellowstone-grpc-proto releases a solana-sdk 4.x compatible version:
-# yellowstone-grpc-client = { version = "3", optional = true }
-# yellowstone-grpc-proto = { version = "3", optional = true }
-# tonic = { version = "0.12", optional = true }
-# prost = { version = "0.13", optional = true }
-# futures = { version = "0.3", optional = true }
-
-# Error handling & logging
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Misc
+dashmap = "6"
 rand = "0.8"
 dotenv = "0.15"
 chrono = "0.4"
 base64 = "0.22"
+
+# Helius LaserStream — native Rust gRPC streaming (replaces Node.js sidecar + Yellowstone)
+helius-laserstream = { version = "0.1", optional = true }
+futures = { version = "0.3", optional = true }
+
+# yellowstone-grpc-client = { version = "4.2.1", optional = true }
+# yellowstone-grpc-proto = { version = "4.2.1", optional = true }
+# tonic = { version = "0.12", optional = true }
+# prost = { version = "0.13", optional = true }
