@@ -3,12 +3,15 @@
   "version": "1.0.0",
   "description": "Helius LaserStream gRPC sidecar for BigAl Sniper — sub-10ms token discovery",
   "type": "module",
-  "main": "sidecar_grpc.js",
+  "main": "sidecar_wss.js",
   "scripts": {
-    "start": "node sidecar_grpc.js"
+    "start": "node sidecar_wss.js",
+    "start:grpc": "node sidecar_grpc.js",
+    "start:wss": "node sidecar_wss.js"
   },
   "dependencies": {
     "helius-laserstream": "^0.3.1",
+    "ws": "^8.18.3",
     "zeromq": "^6.0.0-beta.20"
   }
 }

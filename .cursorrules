@@ -1,0 +1,12 @@
+# BigAl Sniper: m7i-flex / Helius $49 Optimization
+- **Instance:** AWS m7i-flex.large (x86_64, 2 vCPUs).
+- **Network:** Helius Developer Plan (use Gatekeeper Beta WSS).
+- **Core Affinity:**
+  - Core 0: OS tasks + Node.js discovery sidecar.
+  - Core 1: Python main loop + Rust executor signing/execution.
+- **IPC:** Discovery sidecar publishes via `ipc:///tmp/bigal_grpc_sidecar.ipc`.
+- **Trading safety defaults:**
+  - Live buy slippage default: 15%.
+  - Live sell slippage default: 25%.
+  - Priority fee source: Helius `getPriorityFeeEstimate` at extreme level with fallback to `0.002` SOL.
+- **Delivery routing:** prefer dual-path transaction delivery (Helius staked RPC + Jito).
