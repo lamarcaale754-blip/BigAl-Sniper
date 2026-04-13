@@ -2631,7 +2631,7 @@ async def handle_trade_event(msg):
                                 warn = f"⚠ Moonbag exit failed on-chain for {mb.name} ({mb.symbol}); keeping open"
                                 print(warn)
                                 await broadcast_log(warn, "warn")
-                                continue
+                                return
                         realized_pnl += pnl_sol_mb
                         if pnl_sol_mb >= 0:
                             wins += 1; consecutive_losses = 0
