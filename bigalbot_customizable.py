@@ -2373,53 +2373,58 @@ async def maybe_open_from_candidate(mint, msg):
     trade_size = CONFIG["trade_size"]
     if MODE_LIVE and trade_size < MIN_TRADE_SIZE_SOL:
         trade_size = MIN_TRADE_SIZE_SOL
+    # Guard: gRPC sidecar + PumpPortal WS can both trigger this concurrently.
+    # Acquire state_lock so only one coroutine can create a position per mint.
+    # Lock is held through position creation (line positions[mint] = pos) so the
+    # second coroutine sees it and returns. Released before the buy RPC call.
     if buyers >= min_buyers and buy_vol >= CONFIG["entry_vol"] and mint not in positions:
-        if len(positions) >= int(CONFIG["max_positions"]) or paper_balance < trade_size:
-            return
-
-        # --- ANTI-MANIPULATION CHECKS ---
-        if CONFIG["anti_manip"]:
-            # 1. Wallet diversity: check if buy amounts are suspiciously uniform
-            buy_amounts = [s for _, s in cand.buy_events]
-            if len(buy_amounts) >= 2:
-                unique_amounts = len(set(round(a, 4) for a in buy_amounts))
-                diversity = unique_amounts / len(buy_amounts)
-                if diversity < CONFIG["min_wallet_diversity"]:
-                    print(f"🛡 SKIP {cand.name} — fake volume (diversity={diversity:.2f})")
-                    await broadcast_log(f"🛡 SKIP {cand.name} — low wallet diversity", "warn")
-                    return
-
-            # 2. Repeat wallet detection: same wallets across recent entries
-            buyer_list = list(cand.unique_buyers)
-            max_repeats = int(CONFIG["max_repeat_wallets"])
-            for wallet in buyer_list:
-                count = recent_entry_wallets.get(wallet, 0)
-                if count is not None and count >= max_repeats:
-                    print(f"🛡 SKIP {cand.name} — repeat wallet {wallet[:8]}...")
-                    await broadcast_log(f"🛡 SKIP {cand.name} — repeat wallet detected", "warn")
-                    return
-
-            # 3. Random skip: make bot unpredictable so filters can't be reverse-engineered
-            skip_pct = CONFIG["random_skip_pct"]
-            if skip_pct > 0 and random.randint(1, 100) <= skip_pct:
-                print(f"🎲 Random skip: {cand.name} (anti-snipe)")
-                await broadcast_log(f"🎲 Random skip: {cand.name}", "info")
+        async with state_lock:
+            # Re-check under lock — the other coroutine may have just bought this mint
+            if mint in positions or mint in moonbags:
+                return
+            if len(positions) >= int(CONFIG["max_positions"]) or paper_balance < trade_size:
                 return
 
-            # Track wallets for repeat detection
-            for wallet in buyer_list:
-                prev = recent_entry_wallets.get(wallet, 0) or 0
-                recent_entry_wallets.set(wallet, prev + 1)
+            # --- ANTI-MANIPULATION CHECKS ---
+            if CONFIG["anti_manip"]:
+                # 1. Wallet diversity: check if buy amounts are suspiciously uniform
+                buy_amounts = [s for _, s in cand.buy_events]
+                if len(buy_amounts) >= 2:
+                    unique_amounts = len(set(round(a, 4) for a in buy_amounts))
+                    diversity = unique_amounts / len(buy_amounts)
+                    if diversity < CONFIG["min_wallet_diversity"]:
+                        print(f"🛡 SKIP {cand.name} — fake volume (diversity={diversity:.2f})")
+                        return
 
-        pos = Position(
-            mint=mint, name=cand.name, symbol=cand.symbol,
-            size_sol=trade_size, entry_price=price,
-            entry_value_sol=trade_size, entry_time=now,
-            entry_vsol=vsol, last_price=price, max_price=price,
-            last_vsol=vsol, creator=cand.creator,
-        )
-        paper_balance -= trade_size
-        positions[mint] = pos
+                # 2. Repeat wallet detection: same wallets across recent entries
+                buyer_list = list(cand.unique_buyers)
+                max_repeats = int(CONFIG["max_repeat_wallets"])
+                for wallet in buyer_list:
+                    count = recent_entry_wallets.get(wallet, 0)
+                    if count is not None and count >= max_repeats:
+                        print(f"🛡 SKIP {cand.name} — repeat wallet {wallet[:8]}...")
+                        return
+
+                # 3. Random skip: make bot unpredictable so filters can't be reverse-engineered
+                skip_pct = CONFIG["random_skip_pct"]
+                if skip_pct > 0 and random.randint(1, 100) <= skip_pct:
+                    print(f"🎲 Random skip: {cand.name} (anti-snipe)")
+                    return
+
+                # Track wallets for repeat detection
+                for wallet in buyer_list:
+                    prev = recent_entry_wallets.get(wallet, 0) or 0
+                    recent_entry_wallets.set(wallet, prev + 1)
+
+            pos = Position(
+                mint=mint, name=cand.name, symbol=cand.symbol,
+                size_sol=trade_size, entry_price=price,
+                entry_value_sol=trade_size, entry_time=now,
+                entry_vsol=vsol, last_price=price, max_price=price,
+                last_vsol=vsol, creator=cand.creator,
+            )
+            paper_balance -= trade_size
+            positions[mint] = pos
 
         log_msg = (f"🟢 ENTRY {cand.name} ({cand.symbol}) | {buyers} buyers | "
                    f"{buy_vol:.2f} SOL | pump={pump:.1f}% | BC={bc_prog:.1f}% | age={age:.1f}s")
