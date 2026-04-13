@@ -44,6 +44,9 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Concurrent collections
+dashmap = "6"
+
 # Misc
 rand = "0.8"
 dotenv = "0.15"

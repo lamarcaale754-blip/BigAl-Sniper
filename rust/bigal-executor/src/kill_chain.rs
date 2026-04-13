@@ -3,9 +3,12 @@ use solana_sdk::{
     pubkey::Pubkey,
     signer::keypair::Keypair,
 };
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
+use crate::balance_cache::BalanceCache;
+use crate::blockhash_cache::{self, BlockhashHandle};
 use crate::instruction_builder::InstructionBuilder;
 use crate::jito_bundler::JitoBundler;
 use crate::zmq_bridge::{LatencyInfo, TradeResult};
@@ -27,6 +30,8 @@ pub async fn execute_kill(
     keypair: &Keypair,
     mint: &Pubkey,
     tip_lamports: u64,
+    balance_cache: &Arc<BalanceCache>,
+    blockhash_handle: &BlockhashHandle,
     signal_id: String,
     recv_time: Instant,
 ) -> TradeResult {
@@ -39,6 +44,10 @@ pub async fn execute_kill(
 
     let build_start = Instant::now();
 
+    // Use caches for maximum speed on kill chain
+    let cached_bal = balance_cache.get(mint);
+    let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, 30).await;
+
     // Step 1: Build sell-all transaction (100% of holdings) + blockhash aligned with sell signature
     let (sell_tx, tip_blockhash) = match builder.build_sell(
         keypair,
@@ -46,6 +55,8 @@ pub async fn execute_kill(
         100.0,         // sell everything
         2000,          // 20% slippage (aggressive for kills — we want it to land)
         500_000,       // high priority fee
+        cached_bal,
+        cached_bh,
     ).await {
         Ok(pair) => pair,
         Err(e) => {
@@ -67,6 +78,9 @@ pub async fn execute_kill(
         Ok(bundle_id) => {
             let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
+
+            // Clear balance cache after kill
+            balance_cache.remove(mint);
 
             info!(
                 "KILL CHAIN SUCCESS | bundle={} | build={:.0}ms land={:.0}ms total={:.0}ms",
@@ -90,11 +104,14 @@ pub async fn execute_kill(
         Err(e) => {
             warn!("Kill chain Jito submit failed, attempting direct RPC: {}", e);
 
-            // Fallback: rebuild and send via direct RPC
+            // Fallback: rebuild and send via direct RPC (no cache — fresh data for safety)
             match attempt_rpc_kill(builder, keypair, mint).await {
                 Ok(sig) => {
                     let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
                     let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
+
+                    // Clear balance cache after kill
+                    balance_cache.remove(mint);
 
                     warn!("Kill chain landed via RPC fallback: {}", sig);
 
@@ -124,7 +141,7 @@ pub async fn execute_kill(
     }
 }
 
-/// RPC fallback for kill chain when Jito bundle fails
+/// RPC fallback for kill chain when Jito bundle fails — always polls fresh (no cache)
 async fn attempt_rpc_kill(
     builder: &InstructionBuilder,
     keypair: &Keypair,
@@ -136,6 +153,8 @@ async fn attempt_rpc_kill(
         100.0,
         3000,      // even more slippage for fallback
         1_000_000, // maximum priority
+        None,      // no cached balance — poll fresh
+        None,      // no cached blockhash — fetch fresh
     ).await?;
 
     let sig = JitoBundler::send_via_rpc(builder.rpc(), &sell_tx).await?;

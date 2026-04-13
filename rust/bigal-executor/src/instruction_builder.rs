@@ -212,6 +212,9 @@ impl InstructionBuilder {
     }
 
     /// Build a complete buy transaction.
+    ///
+    /// Returns `(transaction, tokens_out)` where `tokens_out` is the expected token amount
+    /// from the bonding curve math. Callers should cache this for fast sell-side balance lookup.
     pub async fn build_buy(
         &self,
         keypair: &Keypair,
@@ -219,7 +222,7 @@ impl InstructionBuilder {
         sol_amount: f64,
         slippage_bps: u16,
         priority_fee: u64,
-    ) -> Result<Transaction> {
+    ) -> Result<(Transaction, u64)> {
         let user = keypair.pubkey();
         let sol_lamports = (sol_amount * 1e9) as u64;
 
@@ -290,7 +293,7 @@ impl InstructionBuilder {
         let mut tx = Transaction::new_unsigned(message);
         tx.sign(&[keypair], recent_blockhash);
 
-        Ok(tx)
+        Ok((tx, tokens_out))
     }
 
     /// Build a complete sell transaction.
@@ -298,6 +301,9 @@ impl InstructionBuilder {
     /// Returns the transaction and the **recent blockhash** used to sign it. The Jito tip tx in a
     /// bundle must use a blockhash from the same "freshness window"; `handle_sell` passes this
     /// hash to [`JitoBundler::submit_bundle`] instead of fetching a second unrelated hash.
+    ///
+    /// `cached_balance` — if provided (from buy-confirmation cache), skips the RPC polling loop.
+    /// `cached_blockhash` — if provided (from rolling pre-fetch), skips the blockhash RPC call.
     pub async fn build_sell(
         &self,
         keypair: &Keypair,
@@ -305,6 +311,8 @@ impl InstructionBuilder {
         pct: f64,
         slippage_bps: u16,
         priority_fee: u64,
+        cached_balance: Option<u64>,
+        cached_blockhash: Option<Hash>,
     ) -> Result<(Transaction, Hash)> {
         let user = keypair.pubkey();
 
@@ -312,46 +320,43 @@ impl InstructionBuilder {
         let assoc_bonding_curve = Self::get_ata(&bonding_curve, mint);
         let user_ata = Self::get_ata(&user, mint);
 
-        // Poll token balance — RPC/indexing can lag right after a fast buy; be patient before Legacy.
-        // Override: BIGAL_SELL_BALANCE_RETRIES, BIGAL_SELL_BALANCE_POLL_MS (base; we add light backoff).
-        // Uses `rpc_read` (HELIUS_READ_RPC_URL) so you can point reads at the same paid Helius HTTP RPC.
-        let mut total_tokens = 0u64;
-        let max_attempts: u32 = env::var("BIGAL_SELL_BALANCE_RETRIES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(72);
-        let base_poll_ms: u64 = env::var("BIGAL_SELL_BALANCE_POLL_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(450);
-        for attempt in 0..max_attempts {
-            let bal = match self.rpc_read.get_token_account_balance(&user_ata).await {
-                Ok(b) if b > 0 => b,
-                Ok(_) | Err(_) => self
-                    .rpc_read
-                    .get_token_balance_json_parsed(&user_ata)
-                    .await
-                    .unwrap_or(0),
-            };
-            if bal > 0 {
-                total_tokens = bal;
-                break;
-            }
-            if attempt < max_attempts - 1 {
-                let extra = (attempt as u64).saturating_mul(20).min(350);
-                let delay_ms = (base_poll_ms + extra).min(1200);
-                debug!(
-                    "SELL: token balance 0, retrying in {}ms (attempt {}/{})",
-                    delay_ms,
-                    attempt + 1,
-                    max_attempts
+        // ── Phase 1+2+3: Parallel RPC fetches with cache fast-paths ──
+        //
+        // If cached_balance is available (from buy confirmation), skip the entire poll loop.
+        // If cached_blockhash is available (from rolling pre-fetch), skip the blockhash RPC call.
+        // Bonding curve fetch runs in parallel with whatever balance resolution we need.
+        let (total_tokens, curve_state, recent_blockhash) = if let Some(cached) = cached_balance {
+            info!("SELL: using cached balance {} tokens (skipping poll loop)", cached);
+            // Cache hit: only need curve + optional blockhash
+            if let Some(bh) = cached_blockhash {
+                let curve_state = self.fetch_bonding_curve(&bonding_curve).await?;
+                (cached, curve_state, bh)
+            } else {
+                let (curve_result, bh_result) = tokio::join!(
+                    self.fetch_bonding_curve(&bonding_curve),
+                    self.rpc.get_latest_blockhash()
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                (cached, curve_result?, bh_result?)
             }
-        }
+        } else if let Some(bh) = cached_blockhash {
+            // No balance cache, but have blockhash: parallel poll + curve only
+            let (balance_result, curve_result) = tokio::join!(
+                poll_token_balance(&self.rpc_read, &user_ata),
+                self.fetch_bonding_curve(&bonding_curve)
+            );
+            (balance_result?, curve_result?, bh)
+        } else {
+            // No caches: parallel poll + curve + blockhash (Phase 1 core improvement)
+            let (balance_result, curve_result, bh_result) = tokio::join!(
+                poll_token_balance(&self.rpc_read, &user_ata),
+                self.fetch_bonding_curve(&bonding_curve),
+                self.rpc.get_latest_blockhash()
+            );
+            (balance_result?, curve_result?, bh_result?)
+        };
 
         if total_tokens == 0 {
-            anyhow::bail!("No tokens to sell for mint {} (after {} retries)", mint, max_attempts);
+            anyhow::bail!("No tokens to sell for mint {}", mint);
         }
 
         let sell_amount = if pct >= 100.0 {
@@ -364,7 +369,6 @@ impl InstructionBuilder {
             anyhow::bail!("Calculated 0 tokens to sell ({}% of {})", pct, total_tokens);
         }
 
-        let curve_state = self.fetch_bonding_curve(&bonding_curve).await?;
         let expected_sol = Self::calculate_sell_sol(&curve_state, sell_amount);
         let min_sol_output = expected_sol - (expected_sol * slippage_bps as u64) / 10_000;
 
@@ -411,8 +415,6 @@ impl InstructionBuilder {
             ixs.push(close_account_ix(&user_ata, &user, &user));
             debug!("SELL 100%: appending CloseAccount for rent recovery on {}", user_ata);
         }
-
-        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
 
         let message = Message::new(&ixs, Some(&user));
 
@@ -519,4 +521,52 @@ impl InstructionBuilder {
     pub fn rpc(&self) -> &RpcClient {
         &self.rpc
     }
+}
+
+/// Poll token balance from RPC with retries and backoff.
+///
+/// Extracted as a standalone function so it can run concurrently via `tokio::join!`
+/// alongside bonding curve and blockhash fetches.
+///
+/// Override defaults with `BIGAL_SELL_BALANCE_RETRIES` (default 20) and
+/// `BIGAL_SELL_BALANCE_POLL_MS` (default 200ms base).
+async fn poll_token_balance(rpc_read: &RpcClient, user_ata: &Pubkey) -> Result<u64> {
+    let max_attempts: u32 = env::var("BIGAL_SELL_BALANCE_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let base_poll_ms: u64 = env::var("BIGAL_SELL_BALANCE_POLL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+
+    for attempt in 0..max_attempts {
+        let bal = match rpc_read.get_token_account_balance(user_ata).await {
+            Ok(b) if b > 0 => b,
+            Ok(_) | Err(_) => rpc_read
+                .get_token_balance_json_parsed(user_ata)
+                .await
+                .unwrap_or(0),
+        };
+        if bal > 0 {
+            return Ok(bal);
+        }
+        if attempt < max_attempts - 1 {
+            let extra = (attempt as u64).saturating_mul(20).min(350);
+            let delay_ms = (base_poll_ms + extra).min(1200);
+            debug!(
+                "SELL: token balance 0, retrying in {}ms (attempt {}/{})",
+                delay_ms,
+                attempt + 1,
+                max_attempts
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+    }
+
+    anyhow::bail!(
+        "No tokens found at {} (after {} retries)",
+        user_ata,
+        max_attempts
+    );
 }

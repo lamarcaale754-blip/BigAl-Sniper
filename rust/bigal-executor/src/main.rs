@@ -1,3 +1,5 @@
+mod balance_cache;
+mod blockhash_cache;
 mod config;
 mod fee_estimator;
 mod grpc_observer;
@@ -15,6 +17,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
+use balance_cache::BalanceCache;
+use blockhash_cache::{BlockhashCache, BlockhashHandle};
 use config::Config;
 use fee_estimator::FeeEstimator;
 use instruction_builder::InstructionBuilder;
@@ -134,6 +138,13 @@ async fn main() -> Result<()> {
         5_000, // poll every 5s (tips change slowly)
     );
 
+    // Balance cache: stores expected token amounts from confirmed buys
+    // so sells can skip the RPC polling loop entirely (Phase 2)
+    let balance_cache = Arc::new(BalanceCache::new(300)); // 5-minute expiry
+
+    // Rolling blockhash pre-fetch: polls every 2s so trades never wait for a blockhash (Phase 3)
+    let blockhash_handle = BlockhashCache::start_polling(cfg.rpc_url.clone(), 2_000);
+
     // Start gRPC observer (if configured)
     if let (Some(grpc_endpoint), Some(grpc_token)) = (&cfg.grpc_endpoint, &cfg.grpc_x_token) {
         let grpc_pub = zmq_bridge::create_grpc_pub(cfg.zmq_grpc_port)
@@ -202,6 +213,8 @@ async fn main() -> Result<()> {
                     &signer,
                     &fee_handle,
                     &tip_handle,
+                    &balance_cache,
+                    &blockhash_handle,
                     signal,
                     recv_time,
                 )
@@ -226,6 +239,8 @@ async fn main() -> Result<()> {
                     &signer,
                     &fee_handle,
                     &tip_handle,
+                    &balance_cache,
+                    &blockhash_handle,
                     signal,
                     recv_time,
                 )
@@ -266,6 +281,8 @@ async fn main() -> Result<()> {
                     &signer,
                     &mint,
                     tip,
+                    &balance_cache,
+                    &blockhash_handle,
                     signal.id,
                     recv_time,
                 )
@@ -322,6 +339,8 @@ async fn handle_buy(
     keypair: &solana_sdk::signer::keypair::Keypair,
     fee_handle: &Arc<std::sync::atomic::AtomicU64>,
     tip_handle: &Arc<std::sync::atomic::AtomicU64>,
+    balance_cache: &Arc<BalanceCache>,
+    blockhash_handle: &BlockhashHandle,
     signal: Signal,
     recv_time: Instant,
 ) -> TradeResult {
@@ -340,24 +359,27 @@ async fn handle_buy(
     };
     let build_start = Instant::now();
 
-    // Build buy transaction
-    let tx = match builder
+    // Build buy transaction — returns (tx, expected_tokens) for balance cache
+    let (tx, tokens_out) = match builder
         .build_buy(keypair, &mint, signal.amount, signal.slippage_bps, priority_fee)
         .await
     {
-        Ok(tx) => tx,
+        Ok(pair) => pair,
         Err(e) => return TradeResult::failed(signal.id, format!("Build failed: {}", e)),
     };
 
     let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
     let land_start = Instant::now();
 
-    // Try Jito bundle first, fall back to direct RPC
-    let blockhash = match builder.rpc().get_latest_blockhash().await {
-        Ok(bh) => bh,
-        Err(e) => {
-            return TradeResult::failed(signal.id, format!("Blockhash failed: {}", e))
-        }
+    // Use cached blockhash for Jito tip tx, fall back to fresh fetch
+    let blockhash = match blockhash_cache::read_cached_blockhash(blockhash_handle, 30).await {
+        Some(bh) => bh,
+        None => match builder.rpc().get_latest_blockhash().await {
+            Ok(bh) => bh,
+            Err(e) => {
+                return TradeResult::failed(signal.id, format!("Blockhash failed: {}", e))
+            }
+        },
     };
 
     let base_tip = if signal.priority_fee_lamports > 0 {
@@ -375,9 +397,12 @@ async fn handle_buy(
             let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
 
+            // Cache expected token balance for fast sell
+            balance_cache.insert(mint, tokens_out);
+
             info!(
-                "BUY confirmed via Jito | mint={} | {:.3} SOL | fee={} tip={} | bundle={} | total={:.0}ms",
-                signal.mint, signal.amount, priority_fee, tip, bundle_id, total_ms
+                "BUY confirmed via Jito | mint={} | {:.3} SOL | ~{} tokens cached | fee={} tip={} | bundle={} | total={:.0}ms",
+                signal.mint, signal.amount, tokens_out, priority_fee, tip, bundle_id, total_ms
             );
 
             TradeResult::confirmed(
@@ -402,9 +427,12 @@ async fn handle_buy(
                     let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
                     let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
 
+                    // Cache expected token balance for fast sell
+                    balance_cache.insert(mint, tokens_out);
+
                     info!(
-                        "BUY confirmed via RPC | mint={} | {:.3} SOL | sig={} | total={:.0}ms",
-                        signal.mint, signal.amount, sig, total_ms
+                        "BUY confirmed via RPC | mint={} | {:.3} SOL | ~{} tokens cached | sig={} | total={:.0}ms",
+                        signal.mint, signal.amount, tokens_out, sig, total_ms
                     );
 
                     TradeResult::confirmed(
@@ -437,12 +465,15 @@ async fn handle_buy(
 ///
 /// Tip tx uses the same recent blockhash as the signed sell (see [`InstructionBuilder::build_sell`]).
 /// Up to two full rebuild+land rounds for transient failures.
+/// Attempt 1 uses balance cache + blockhash cache; attempt 2 polls fresh.
 async fn handle_sell(
     builder: &InstructionBuilder,
     bundler: &JitoBundler,
     keypair: &solana_sdk::signer::keypair::Keypair,
     fee_handle: &Arc<std::sync::atomic::AtomicU64>,
     tip_handle: &Arc<std::sync::atomic::AtomicU64>,
+    balance_cache: &Arc<BalanceCache>,
+    blockhash_handle: &BlockhashHandle,
     signal: Signal,
     recv_time: Instant,
 ) -> TradeResult {
@@ -477,15 +508,24 @@ async fn handle_sell(
     for attempt in 1..=2u8 {
         let build_start = Instant::now();
 
+        // Attempt 1: use balance cache + blockhash cache for maximum speed
+        // Attempt 2: force fresh RPC polls (cache may have been wrong)
+        let cached_bal = if attempt == 1 {
+            balance_cache.get(&mint)
+        } else {
+            None
+        };
+        let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, 30).await;
+
         let (tx, tip_blockhash) = match builder
-            .build_sell(keypair, &mint, pct, signal.slippage_bps, priority_fee)
+            .build_sell(keypair, &mint, pct, signal.slippage_bps, priority_fee, cached_bal, cached_bh)
             .await
         {
             Ok(x) => x,
             Err(e) => {
                 if attempt < 2 {
                     warn!(
-                        "SELL build attempt {} failed: {}, retrying after 250ms",
+                        "SELL build attempt {} failed: {}, retrying fresh (no cache)",
                         attempt, e
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -505,6 +545,9 @@ async fn handle_sell(
             Ok(bundle_id) => {
                 let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
+
+                // Clear balance cache after confirmed sell
+                balance_cache.remove(&mint);
 
                 info!(
                     "SELL confirmed via Jito | mint={} | {}% | fee={} tip={} | bundle={} | total={:.0}ms | attempt={}",
@@ -535,6 +578,9 @@ async fn handle_sell(
                     Ok(sig) => {
                         let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
                         let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
+
+                        // Clear balance cache after confirmed sell
+                        balance_cache.remove(&mint);
 
                         info!(
                             "SELL confirmed via RPC | mint={} | {}% | sig={} | total={:.0}ms | attempt={}",
