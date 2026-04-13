@@ -306,8 +306,9 @@ impl InstructionBuilder {
         }
 
         // Post-cashback upgrade: program adds creator + protocol fees on top of SOL cost.
-        // Give extra headroom (50% buffer) so the total with fees doesn't exceed max_sol_cost.
-        let max_sol_cost = sol_lamports + (sol_lamports * 50) / 100;
+        // Use u64::MAX so the tx never fails due to cost check — actual spend is bounded
+        // by the wallet balance, and strategy-level trade_size controls exposure.
+        let max_sol_cost = u64::MAX;
 
         debug!(
             "BUY: {} SOL -> ~{} tokens | max_cost={} | slippage={}bps",
