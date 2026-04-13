@@ -1637,29 +1637,43 @@ async def broadcast_config():
     await send_to_dashboard({"type": "config", "data": dict(CONFIG)})
 
 
-async def wallet_chain_snapshot() -> dict:
-    """RPC wallet balance and change vs session baseline (includes fees, tips, slippage)."""
+_wallet_snapshot_cache: dict = {"chain_balance": None, "wallet_delta_sol": None, "session_wallet_baseline": None}
+_wallet_snapshot_ts: float = 0.0
+_WALLET_SNAPSHOT_TTL = float(os.environ.get("WALLET_SNAPSHOT_TTL_SEC", "5"))
+
+
+async def wallet_chain_snapshot(force_rpc: bool = False) -> dict:
+    """Cached RPC wallet balance — only calls RPC every WALLET_SNAPSHOT_TTL_SEC (default 5s).
+    Trade-event broadcasts use the cache; the ticker forces a refresh."""
+    global _wallet_snapshot_cache, _wallet_snapshot_ts
+    now = time.time()
+    if not force_rpc and (now - _wallet_snapshot_ts) < _WALLET_SNAPSHOT_TTL:
+        return _wallet_snapshot_cache
+
     track = (
         (MODE_LIVE or (MODE_RUG_PULLER and RUG_PULLER_LIVE))
         and executor is not None
         and getattr(executor, "name", None) != "paper"
     )
     if not track:
-        return {
+        _wallet_snapshot_cache = {
             "chain_balance": None,
             "wallet_delta_sol": None,
             "session_wallet_baseline": None,
         }
+        return _wallet_snapshot_cache
     bal = await get_live_balance()
     baseline = session_wallet_start_sol
     dlt = None
     if bal is not None and baseline is not None:
         dlt = bal - baseline
-    return {
+    _wallet_snapshot_cache = {
         "chain_balance": round(bal, 6) if bal is not None else None,
         "wallet_delta_sol": round(dlt, 6) if dlt is not None else None,
         "session_wallet_baseline": round(baseline, 6) if baseline is not None else None,
     }
+    _wallet_snapshot_ts = now
+    return _wallet_snapshot_cache
 
 
 _last_broadcast_stats_time: float = 0.0
@@ -1667,8 +1681,8 @@ _last_broadcast_stats_time: float = 0.0
 async def broadcast_stats():
     global _last_broadcast_stats_time
     now = time.time()
-    if now - _last_broadcast_stats_time < 1.0:
-        return  # rate limit: max 1 broadcast per second
+    if now - _last_broadcast_stats_time < 0.15:
+        return  # rate limit: max ~6 broadcasts per second
     _last_broadcast_stats_time = now
     wr = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
     all_pos = {**positions, **moonbags}
@@ -2752,7 +2766,7 @@ async def dashboard_ticker():
     global paper_balance
     balance_check_counter = 0
     while True:
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
         if dashboard_clients:
             balance_check_counter += 1
             if MODE_LIVE and balance_check_counter >= 10:
