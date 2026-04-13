@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zeromq::{PubSocket, PullSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 /// Inbound signal from Python (trade command or ping)
@@ -116,9 +116,35 @@ impl ZmqBridge {
     /// Create and connect a new ZMQ bridge.
     /// `signal_connect` — Python PUSH bind address (Rust PULL connects).
     /// `result_bind` — address Rust PUB binds (Python SUB connects).
+    ///
+    /// Retries connection for up to 60s if Python hasn't bound the IPC sockets yet,
+    /// so startup order doesn't matter.
     pub async fn new(signal_connect: &str, result_bind: &str) -> Result<Self> {
         let signal_addr = signal_connect.to_string();
         let result_addr = result_bind.to_string();
+
+        let max_wait_secs: u64 = std::env::var("ZMQ_CONNECT_WAIT_SEC")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+        let poll_ms = 500u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_wait_secs);
+
+        // Wait for IPC socket files to exist (Python binds them on mode select)
+        if signal_addr.starts_with("ipc://") {
+            let path = &signal_addr["ipc://".len()..];
+            if !std::path::Path::new(path).exists() {
+                info!("Waiting for Python to bind ZMQ (select Live Rust in dashboard)...");
+                while !std::path::Path::new(path).exists() {
+                    if std::time::Instant::now() > deadline {
+                        anyhow::bail!(
+                            "Timed out waiting {}s for Python ZMQ socket at {}",
+                            max_wait_secs, path
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+                }
+                info!("Python ZMQ socket detected — connecting");
+            }
+        }
 
         // PULL socket: receive signals from Python
         let mut pull = PullSocket::new();
@@ -126,12 +152,32 @@ impl ZmqBridge {
             .await
             .with_context(|| format!("Failed to connect PULL to {}", signal_addr))?;
 
-        // PUB socket: publish results to Python
+        // PUB socket: publish results to Python — retry if address in use (stale socket)
         let mut pub_sock = PubSocket::new();
-        pub_sock
-            .bind(&result_addr)
-            .await
-            .with_context(|| format!("Failed to bind PUB on {}", result_addr))?;
+        let mut bound = false;
+        while std::time::Instant::now() < deadline {
+            match pub_sock.bind(&result_addr).await {
+                Ok(_) => { bound = true; break; }
+                Err(e) => {
+                    let msg = format!("{}", e);
+                    if msg.contains("Address already in use") || msg.contains("os error 98") {
+                        // Stale IPC socket from previous run — remove and retry
+                        if result_addr.starts_with("ipc://") {
+                            let path = &result_addr["ipc://".len()..];
+                            let _ = std::fs::remove_file(path);
+                            warn!("Removed stale IPC socket {}, retrying bind...", path);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+                        pub_sock = PubSocket::new();
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!("Failed to bind PUB on {}: {}", result_addr, e));
+                }
+            }
+        }
+        if !bound {
+            anyhow::bail!("Timed out binding PUB on {}", result_addr);
+        }
 
         info!(
             "ZMQ PULL connected to {}, PUB bound on {}",
