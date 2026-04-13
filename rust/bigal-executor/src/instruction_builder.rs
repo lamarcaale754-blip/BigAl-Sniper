@@ -330,9 +330,7 @@ impl InstructionBuilder {
         let fee_config = Self::derive_fee_config();
         let bonding_curve_v2 = self.derive_bonding_curve_v2(mint);
 
-        // Standard buy: 15 accounts. fee_program + bonding_curve_v2 are only needed
-        // for specific token versions (mayhem/cashback) — passing them to standard tokens
-        // causes 6000 "not authorized" because the program doesn't expect extra accounts.
+        // 17 accounts — verified against successful 3rd-party Pump.fun buy on-chain
         let accounts = vec![
             AccountMeta::new_readonly(self.global_config, false),     // 0  global
             AccountMeta::new(self.fee_recipient, false),              // 1  fee_recipient
@@ -349,6 +347,8 @@ impl InstructionBuilder {
             AccountMeta::new_readonly(global_vol_acc, false),         // 12 global_volume_accumulator
             AccountMeta::new(user_vol_acc, false),                    // 13 user_volume_accumulator
             AccountMeta::new_readonly(fee_config, false),             // 14 fee_config
+            AccountMeta::new_readonly(fee_program, false),            // 15 fee_program
+            AccountMeta::new_readonly(bonding_curve_v2, false),       // 16 bonding_curve_v2
         ];
 
         let buy_ix = Instruction::new_with_bytes(self.program_id, &ix_bytes, accounts);
@@ -509,7 +509,7 @@ impl InstructionBuilder {
         let bonding_curve_v2 = self.derive_bonding_curve_v2(mint);
         let user_vol_acc = self.derive_user_volume_accumulator(&user);
 
-        // Standard sell: 14 accounts (no fee_program/bonding_curve_v2 for standard tokens)
+        // 16 accounts — verified against on-chain layout (sell has no global_volume_accumulator)
         let accounts = vec![
             AccountMeta::new_readonly(self.global_config, false),     // 0  global
             AccountMeta::new(self.fee_recipient, false),              // 1  fee_recipient
@@ -524,7 +524,9 @@ impl InstructionBuilder {
             AccountMeta::new_readonly(self.event_authority, false),   // 10 event_authority
             AccountMeta::new_readonly(self.program_id, false),        // 11 program
             AccountMeta::new_readonly(fee_config, false),             // 12 fee_config
-            AccountMeta::new(user_vol_acc, false),                    // 13 user_volume_accumulator
+            AccountMeta::new_readonly(fee_program, false),            // 13 fee_program
+            AccountMeta::new(user_vol_acc, false),                    // 14 user_volume_accumulator
+            AccountMeta::new_readonly(bonding_curve_v2, false),       // 15 bonding_curve_v2
         ];
 
         let sell_ix = Instruction::new_with_bytes(self.program_id, &ix_bytes, accounts);
