@@ -340,7 +340,8 @@ pub async fn start_laserstream_observer(
         endpoint, pump_program
     );
 
-    let (mut stream, _handle) = subscribe(config, request);
+    let (stream, _handle) = subscribe(config, request);
+    tokio::pin!(stream);
 
     // Pump.fun discriminators
     const DISC_CREATE: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
