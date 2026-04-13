@@ -159,48 +159,52 @@ async fn main() -> Result<()> {
         info!("RPC connections warmed in {:.0}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
     }
 
-    // Start streaming observer — prefer LaserStream > Yellowstone > none.
-    // LaserStream is 4x faster, has auto-reconnect, and replaces the Node.js sidecar.
-    let streaming_zmq_pub = zmq_bridge::create_yellowstone_pub(&cfg.zmq_yellowstone_bind)
-        .await
-        .context("Failed to create streaming ZMQ PUB socket")?;
-    let streaming_zmq_pub = Arc::new(tokio::sync::Mutex::new(streaming_zmq_pub));
+    // Start streaming observer — only bind ZMQ PUB if streaming is configured.
+    let needs_streaming = cfg.laserstream_api_key.is_some()
+        || (cfg.grpc_endpoint.is_some() && cfg.grpc_x_token.is_some());
 
-    if let Some(ls_key) = &cfg.laserstream_api_key {
-        let ls_endpoint = cfg.laserstream_endpoint.clone()
-            .unwrap_or_else(|| "https://laserstream-mainnet-ewr.helius-rpc.com".to_string());
-        let key = ls_key.clone();
-        let program = cfg.pump_program_id.to_string();
-        let pub_sock = streaming_zmq_pub.clone();
+    if needs_streaming {
+        let streaming_zmq_pub = zmq_bridge::create_yellowstone_pub(&cfg.zmq_yellowstone_bind)
+            .await
+            .context("Failed to create streaming ZMQ PUB socket")?;
+        let streaming_zmq_pub = Arc::new(tokio::sync::Mutex::new(streaming_zmq_pub));
 
-        tokio::spawn(async move {
-            loop {
-                if let Err(e) = grpc_observer::start_laserstream_observer(
-                    &key, &ls_endpoint, &program, pub_sock.clone(),
-                ).await {
-                    error!("LaserStream error: {} — restarting in 3s", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        if let Some(ls_key) = &cfg.laserstream_api_key {
+            let ls_endpoint = cfg.laserstream_endpoint.clone()
+                .unwrap_or_else(|| "https://laserstream-mainnet-ewr.helius-rpc.com".to_string());
+            let key = ls_key.clone();
+            let program = cfg.pump_program_id.to_string();
+            let pub_sock = streaming_zmq_pub.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    if let Err(e) = grpc_observer::start_laserstream_observer(
+                        &key, &ls_endpoint, &program, pub_sock.clone(),
+                    ).await {
+                        error!("LaserStream error: {} — restarting in 3s", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    }
                 }
-            }
-        });
-        info!("Streaming: LaserStream (native Rust, replaces Node.js sidecar)");
-    } else if let (Some(grpc_endpoint), Some(grpc_token)) = (&cfg.grpc_endpoint, &cfg.grpc_x_token) {
-        let endpoint = grpc_endpoint.clone();
-        let token = grpc_token.clone();
-        let program = cfg.pump_program_id.to_string();
-        let pub_sock = streaming_zmq_pub.clone();
+            });
+            info!("Streaming: LaserStream (native Rust, replaces Node.js sidecar)");
+        } else if let (Some(grpc_endpoint), Some(grpc_token)) = (&cfg.grpc_endpoint, &cfg.grpc_x_token) {
+            let endpoint = grpc_endpoint.clone();
+            let token = grpc_token.clone();
+            let program = cfg.pump_program_id.to_string();
+            let pub_sock = streaming_zmq_pub.clone();
 
-        tokio::spawn(async move {
-            loop {
-                if let Err(e) = grpc_observer::start_grpc_observer(
-                    &endpoint, &token, &program, vec![], pub_sock.clone(),
-                ).await {
-                    error!("gRPC observer error: {} — reconnecting in 5s", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::spawn(async move {
+                loop {
+                    if let Err(e) = grpc_observer::start_grpc_observer(
+                        &endpoint, &token, &program, vec![], pub_sock.clone(),
+                    ).await {
+                        error!("gRPC observer error: {} — reconnecting in 5s", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
                 }
-            }
-        });
-        info!("Streaming: Yellowstone gRPC");
+            });
+            info!("Streaming: Yellowstone gRPC");
+        }
     } else {
         info!("Streaming: none (set LASERSTREAM_API_KEY or GRPC_ENDPOINT to enable)");
     }
