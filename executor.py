@@ -69,6 +69,16 @@ def _rust_sell_should_retry(result: Optional[dict]) -> bool:
         "signer error",
         "unknown action",
         "missing config",
+        # On-chain permanent failures (Rust now classifies these)
+        "overflow",
+        "6024",
+        "0x1788",
+        "accountnotinitialized",
+        "3012",
+        "depleted",
+        "insufficient funds",
+        "insufficient lamports",
+        "permanent",
     )
     if any(s in err for s in permanent):
         return False
@@ -470,9 +480,10 @@ class ZmqExecutor(ExecutorBackend):
         self._log_rust_rejection("sell", last_result)
         # Never fall back to Legacy for sells — its 15% slippage destroys PnL.
         # If Rust fails 3 times the position stays open for the next monitor cycle.
+        err_detail = (last_result or {}).get("error", "unknown")
         print(
             f"[ZmqExecutor] SELL FAILED after {_RUST_SELL_ATTEMPTS} Rust attempt(s) — "
-            "no Legacy fallback (would destroy PnL with 15% slippage)"
+            f"reason: {err_detail}"
         )
         return None
 

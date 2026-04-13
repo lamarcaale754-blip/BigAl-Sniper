@@ -4,7 +4,7 @@ use solana_sdk::{
 };
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::balance_cache::BalanceCache;
 use crate::blockhash_cache::{self, BlockhashHandle};
@@ -83,21 +83,49 @@ pub async fn execute_kill(
 
     match submission_result {
         Ok((sig_or_id, method)) => {
+            // Verify chain confirmation — kill must actually land, not just be accepted
+            let mut tx_ref = sig_or_id.clone();
+            let mut method_ref = method.to_string();
+
+            // If Jito returned a bundle UUID (not a tx sig), try RPC broadcast to get a sig
+            if !crate::looks_like_tx_signature(&tx_ref) {
+                if let Ok(rpc_sig) = JitoBundler::send_via_rpc(builder.rpc(), &sell_tx).await {
+                    tx_ref = rpc_sig;
+                    method_ref = format!("{}+rpc", method);
+                }
+            }
+
+            if crate::looks_like_tx_signature(&tx_ref) {
+                let confirm_timeout: u64 = std::env::var("BIGAL_CONFIRM_TIMEOUT_SEC")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(14);
+                if let Err(e) = crate::await_chain_confirmation(
+                    builder.rpc(), &tx_ref, confirm_timeout, false,
+                ).await {
+                    error!("KILL chain confirm failed: {}", e);
+                    return TradeResult::failed(
+                        signal_id,
+                        format!("KILL broadcast OK but chain failed: {}", e),
+                    );
+                }
+            } else {
+                warn!("KILL landed via {} but no tx sig to verify ({})", method_ref, tx_ref);
+            }
+
             let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
 
             balance_cache.remove(mint);
 
-            let tip_used = if method == "jito_kill" { tip_lamports } else { 0 };
+            let tip_used = if method_ref.contains("jito") { tip_lamports } else { 0 };
             info!(
                 "KILL CHAIN SUCCESS via {} | {} | build={:.0}ms land={:.0}ms total={:.0}ms",
-                method, sig_or_id, build_ms, land_ms, total_ms
+                method_ref, tx_ref, build_ms, land_ms, total_ms
             );
 
             TradeResult::confirmed(
                 signal_id,
-                sig_or_id,
-                method.to_string(),
+                tx_ref,
+                method_ref,
                 LatencyInfo {
                     zmq_recv_ms,
                     build_ms,

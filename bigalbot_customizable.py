@@ -592,6 +592,22 @@ profiler: Optional[WalletProfiler] = None
 orchestrator: Optional[RugOrchestrator] = None
 wallet_dev: Optional[WalletDeveloper] = None
 wallet_dev_task: Optional[asyncio.Task] = None
+execution_counters: Dict[str, int] = {
+    "skip_cooldown": 0,
+    "skip_paused": 0,
+    "skip_creator_buyer": 0,
+    "skip_low_liquidity": 0,
+    "skip_overpump": 0,
+    "skip_progress_window": 0,
+    "skip_orderflow": 0,
+    "skip_too_early": 0,
+    "skip_capacity_or_balance": 0,
+    "skip_anti_manip_diversity": 0,
+    "skip_anti_manip_repeat_wallet": 0,
+    "skip_randomized": 0,
+    "buy_failed_chain": 0,
+    "sell_failed_chain": 0,
+}
 
 # Rug Puller session settings (dashboard "Rug Puller Settings")
 RUG_SETTINGS: Dict[str, object] = {
@@ -768,14 +784,24 @@ async def manual_sell_position(mint):
     pnl_sol = active * (pnl_pct / 100.0)
     hold = now - pos.entry_time
 
+    sell_ok = True
+    if MODE_LIVE:
+        sell_ok = await live_sell_pump(mint)
+        if not sell_ok:
+            async with state_lock:
+                if mint in source:
+                    source[mint].closing = False
+            _bump_counter("sell_failed_chain")
+            msg = f"⚠ Manual sell failed on-chain for {pos.name} ({pos.symbol}); position kept open"
+            print(msg)
+            await broadcast_log(msg, "warn")
+            return
+
     realized_pnl += pnl_sol
     if pnl_sol >= 0:
         wins += 1; consecutive_losses = 0
     else:
         losses += 1; consecutive_losses += 1
-
-    if MODE_LIVE:
-        await live_sell_pump(mint)
 
     paper_balance += max(active + pnl_sol, 0.0)
     log_trade(pos.entry_time, now, mint, pos.name, pos.symbol, pos.creator,
@@ -787,13 +813,20 @@ async def manual_sell_position(mint):
     level = "exit-win" if pnl_sol >= 0 else "exit-loss"
     await broadcast_log(log_msg, level)
 
+    confirm_mark = "✅" if MODE_LIVE and sell_ok else ""
     trade_history.append({
         "time": datetime.now().strftime("%H:%M:%S"), "timestamp": now * 1000,
-        "name": pos.name, "symbol": pos.symbol,
+        "name": f"{pos.name} {confirm_mark}".strip(), "symbol": pos.symbol,
         "pnl_pct": round(pnl_pct, 2), "pnl_sol": round(pnl_sol, 6),
+        "projected_pnl_sol": round(pnl_sol, 6),
+        "execution_confirmed": bool(sell_ok),
+        "confirmation_mark": confirm_mark,
         "cum_pnl": round(realized_pnl, 6), "balance": round(paper_balance, 4),
         "hold_time": round(hold, 1), "reason": "Manual",
     })
+    if _tracks_live_wallet():
+        wsnap = await wallet_chain_snapshot(force_rpc=True)
+        trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
     await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
     source.pop(mint, None)
     print(f"✅ Closed {pos.name} | Bal: {paper_balance:.4f} | W/L: {wins}/{losses}")
@@ -1421,7 +1454,10 @@ async def dashboard_handler(websocket):
     await send_to_dashboard({
         "type": "snapshot",
         "data": {
-            "balance": paper_balance, "pnl": realized_pnl,
+            "balance": paper_balance,
+            "pnl": realized_pnl,
+            "projected_pnl": realized_pnl,
+            "actual_wallet_pnl": _actual_wallet_pnl_from_snapshot(wsnap),
             "wins": wins, "losses": losses,
             "positions": [p.to_dict() for p in all_pos.values()],
             "trade_history": trade_history[-100:],
@@ -1438,6 +1474,7 @@ async def dashboard_handler(websocket):
             "presets": {k: True for k in get_all_presets()},
             "custom_presets": list(load_custom_presets().keys()),
             "wallet_dev": _wallet_dev_snapshot(),
+            "execution_counters": dict(execution_counters),
             "startup_hints": _startup_hints(),
             **wsnap,
         }
@@ -1642,6 +1679,23 @@ _wallet_snapshot_ts: float = 0.0
 _WALLET_SNAPSHOT_TTL = float(os.environ.get("WALLET_SNAPSHOT_TTL_SEC", "5"))
 
 
+def _tracks_live_wallet() -> bool:
+    return (
+        (MODE_LIVE or (MODE_RUG_PULLER and RUG_PULLER_LIVE))
+        and executor is not None
+        and getattr(executor, "name", None) != "paper"
+    )
+
+
+def _actual_wallet_pnl_from_snapshot(wsnap: dict) -> Optional[float]:
+    wallet_delta = wsnap.get("wallet_delta_sol")
+    return round(wallet_delta, 6) if wallet_delta is not None else None
+
+
+def _bump_counter(key: str) -> None:
+    execution_counters[key] = execution_counters.get(key, 0) + 1
+
+
 async def wallet_chain_snapshot(force_rpc: bool = False) -> dict:
     """Cached RPC wallet balance — only calls RPC every WALLET_SNAPSHOT_TTL_SEC (default 5s).
     Trade-event broadcasts use the cache; the ticker forces a refresh."""
@@ -1650,11 +1704,7 @@ async def wallet_chain_snapshot(force_rpc: bool = False) -> dict:
     if not force_rpc and (now - _wallet_snapshot_ts) < _WALLET_SNAPSHOT_TTL:
         return _wallet_snapshot_cache
 
-    track = (
-        (MODE_LIVE or (MODE_RUG_PULLER and RUG_PULLER_LIVE))
-        and executor is not None
-        and getattr(executor, "name", None) != "paper"
-    )
+    track = _tracks_live_wallet()
     if not track:
         _wallet_snapshot_cache = {
             "chain_balance": None,
@@ -1691,7 +1741,10 @@ async def broadcast_stats():
     await send_to_dashboard({
         "type": "stats",
         "data": {
-            "balance": round(paper_balance, 6), "pnl": round(realized_pnl, 6),
+            "balance": round(paper_balance, 6),
+            "pnl": round(realized_pnl, 6),
+            "projected_pnl": round(realized_pnl, 6),
+            "actual_wallet_pnl": _actual_wallet_pnl_from_snapshot(wsnap),
             "wins": wins, "losses": losses, "win_rate": round(wr, 1),
             "open_positions": len(positions),
             "moonbags": len(moonbags),
@@ -1707,6 +1760,7 @@ async def broadcast_stats():
             "rug_puller_live": RUG_PULLER_LIVE,
             "profiler_stats": profiler.get_profiler_stats() if profiler else None,
             "wallet_dev": _wallet_dev_snapshot(),
+            "execution_counters": dict(execution_counters),
             **wsnap,
         }
     })
@@ -2044,12 +2098,33 @@ async def position_monitor():
 
             active = pos.remaining_size_sol
             pnl_sol = active * (pnl_pct / 100.0)
-            realized_pnl += pnl_sol
 
             is_profitable = pnl_sol >= 0
             mb_pct = CONFIG["moonbag_pct"]
             should_moonbag = (not is_mb and is_profitable and mb_pct > 0 and "RUG" not in reason)
 
+            sell_pct = (100 - mb_pct) if should_moonbag else 100
+            sell_size = active * (sell_pct / 100.0)
+            moonbag_size = active - sell_size if should_moonbag else 0
+
+            sell_ok = True
+            if MODE_LIVE:
+                sell_str = f"{sell_pct}%" if sell_pct < 100 else "100%"
+                sell_ok = await live_sell_pump(mint, sell_str)
+                if not sell_ok:
+                    async with state_lock:
+                        if mint in source:
+                            source[mint].closing = False
+                    _bump_counter("sell_failed_chain")
+                    warn = (
+                        f"⚠ EXIT FAILED on-chain for {pos.name} ({pos.symbol}) | "
+                        f"{reason} | keeping position open"
+                    )
+                    print(warn)
+                    await broadcast_log(warn, "warn")
+                    continue
+
+            realized_pnl += pnl_sol
             if is_profitable:
                 wins += 1
                 consecutive_losses = 0
@@ -2060,14 +2135,6 @@ async def position_monitor():
                     add_to_creator_blacklist(pos.creator, pos.name)
                 if consecutive_losses >= CONFIG["cooldown_losses"]:
                     cooldown_until = now + CONFIG["cooldown_sec"]
-
-            sell_pct = (100 - mb_pct) if should_moonbag else 100
-            sell_size = active * (sell_pct / 100.0)
-            moonbag_size = active - sell_size if should_moonbag else 0
-
-            if MODE_LIVE:
-                sell_str = f"{sell_pct}%" if sell_pct < 100 else "100%"
-                await live_sell_pump(mint, sell_str)
 
             exit_value = sell_size + (sell_size * (pnl_pct / 100.0))
             paper_balance += max(exit_value, 0.0)
@@ -2082,14 +2149,21 @@ async def position_monitor():
             level = "exit-win" if is_profitable else "exit-loss"
             await broadcast_log(log_msg, level)
 
+            confirm_mark = "✅" if MODE_LIVE and sell_ok else ""
             trade_history.append({
                 "time": datetime.now().strftime("%H:%M:%S"), "timestamp": now * 1000,
-                "name": pos.name, "symbol": pos.symbol,
+                "name": f"{pos.name} {confirm_mark}".strip(), "symbol": pos.symbol,
                 "pnl_pct": round(pnl_pct, 2),
                 "pnl_sol": round(sell_size * (pnl_pct / 100.0), 6),
+                "projected_pnl_sol": round(sell_size * (pnl_pct / 100.0), 6),
+                "execution_confirmed": bool(sell_ok),
+                "confirmation_mark": confirm_mark,
                 "cum_pnl": round(realized_pnl, 6), "balance": round(paper_balance, 4),
                 "hold_time": round(hold, 1), "reason": reason + (" 🌙" if should_moonbag else ""),
             })
+            if _tracks_live_wallet():
+                wsnap = await wallet_chain_snapshot(force_rpc=True)
+                trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
             await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
             source.pop(mint, None)
 
@@ -2285,8 +2359,10 @@ async def maybe_open_from_candidate(mint, msg):
 
     now = time.time()
     if now < cooldown_until:
+        _bump_counter("skip_cooldown")
         return
     if TRADING_PAUSED:
+        _bump_counter("skip_paused")
         return
 
     try:
@@ -2317,6 +2393,7 @@ async def maybe_open_from_candidate(mint, msg):
 
     if tx_type == "buy":
         if SKIP_CREATOR_AS_BUYER and trader == cand.creator and cand.creator:
+            _bump_counter("skip_creator_buyer")
             return
         cand.unique_buyers.add(str(trader))
         if sol_amount > 0:
@@ -2350,24 +2427,30 @@ async def maybe_open_from_candidate(mint, msg):
     strat_params = resolve_parameters(CONFIG, adaptive_state)
 
     if vsol < strat_params["min_liquidity"]:
+        _bump_counter("skip_low_liquidity")
         return
 
     pump = (price / cand.initial_price - 1.0) * 100.0
     if pump > CONFIG["max_pump"]:
+        _bump_counter("skip_overpump")
         candidates.pop(mint, None)
         return
 
     if bc_prog < strat_params["entry_progress"]:
+        _bump_counter("skip_progress_window")
         return
     if bc_prog > CONFIG["bc_max"]:
+        _bump_counter("skip_progress_window")
         candidates.pop(mint, None)
         return
 
     if sr > CONFIG["sell_ratio"] or net < CONFIG["net_buy"]:
+        _bump_counter("skip_orderflow")
         return
 
     age = now - cand.created_at
     if age < CONFIG["min_age"]:
+        _bump_counter("skip_too_early")
         return
 
     trade_size = CONFIG["trade_size"]
@@ -2383,6 +2466,7 @@ async def maybe_open_from_candidate(mint, msg):
             if mint in positions or mint in moonbags:
                 return
             if len(positions) >= int(CONFIG["max_positions"]) or paper_balance < trade_size:
+                _bump_counter("skip_capacity_or_balance")
                 return
 
             # --- ANTI-MANIPULATION CHECKS ---
@@ -2393,6 +2477,7 @@ async def maybe_open_from_candidate(mint, msg):
                     unique_amounts = len(set(round(a, 4) for a in buy_amounts))
                     diversity = unique_amounts / len(buy_amounts)
                     if diversity < CONFIG["min_wallet_diversity"]:
+                        _bump_counter("skip_anti_manip_diversity")
                         print(f"🛡 SKIP {cand.name} — fake volume (diversity={diversity:.2f})")
                         return
 
@@ -2402,12 +2487,14 @@ async def maybe_open_from_candidate(mint, msg):
                 for wallet in buyer_list:
                     count = recent_entry_wallets.get(wallet, 0)
                     if count is not None and count >= max_repeats:
+                        _bump_counter("skip_anti_manip_repeat_wallet")
                         print(f"🛡 SKIP {cand.name} — repeat wallet {wallet[:8]}...")
                         return
 
                 # 3. Random skip: make bot unpredictable so filters can't be reverse-engineered
                 skip_pct = CONFIG["random_skip_pct"]
                 if skip_pct > 0 and random.randint(1, 100) <= skip_pct:
+                    _bump_counter("skip_randomized")
                     print(f"🎲 Random skip: {cand.name} (anti-snipe)")
                     return
 
@@ -2438,8 +2525,12 @@ async def maybe_open_from_candidate(mint, msg):
         if MODE_LIVE:
             sig = await live_buy_pump(mint, trade_size)
             if sig is None:
+                _bump_counter("buy_failed_chain")
                 paper_balance += trade_size
                 positions.pop(mint, None)
+                warn = f"⚠ BUY failed on-chain for {cand.name} ({cand.symbol}) | entry skipped"
+                print(warn)
+                await broadcast_log(warn, "warn")
                 return
             pos.buy_tx_sig = sig
 
@@ -2531,12 +2622,21 @@ async def handle_trade_event(msg):
                         mb.closing = True  # lock before await to prevent double-sell
                         active_mb = mb.remaining_size_sol
                         pnl_sol_mb = active_mb * (mb_pnl / 100.0)
+                        sell_ok = True
+                        if MODE_LIVE:
+                            sell_ok = await live_sell_pump(mint)
+                            if not sell_ok:
+                                mb.closing = False
+                                _bump_counter("sell_failed_chain")
+                                warn = f"⚠ Moonbag exit failed on-chain for {mb.name} ({mb.symbol}); keeping open"
+                                print(warn)
+                                await broadcast_log(warn, "warn")
+                                continue
                         realized_pnl += pnl_sol_mb
                         if pnl_sol_mb >= 0:
                             wins += 1; consecutive_losses = 0
                         else:
                             losses += 1; consecutive_losses += 1
-                        if MODE_LIVE: await live_sell_pump(mint)
                         paper_balance += max(active_mb + pnl_sol_mb, 0.0)
                         log_trade(mb.entry_time, time.time(), mint, mb.name, mb.symbol, mb.creator,
                                   "SELL", active_mb, mb.entry_price, price_mb, pnl_sol_mb, mb_pnl, mb_reason)
@@ -2544,13 +2644,20 @@ async def handle_trade_event(msg):
                         print(log_msg)
                         level = "exit-win" if pnl_sol_mb >= 0 else "exit-loss"
                         await broadcast_log(log_msg, level)
+                        confirm_mark = "✅" if MODE_LIVE and sell_ok else ""
                         trade_history.append({
                             "time": datetime.now().strftime("%H:%M:%S"), "timestamp": time.time() * 1000,
-                            "name": mb.name, "symbol": mb.symbol,
+                            "name": f"{mb.name} {confirm_mark}".strip(), "symbol": mb.symbol,
                             "pnl_pct": round(mb_pnl, 2), "pnl_sol": round(pnl_sol_mb, 6),
+                            "projected_pnl_sol": round(pnl_sol_mb, 6),
+                            "execution_confirmed": bool(sell_ok),
+                            "confirmation_mark": confirm_mark,
                             "cum_pnl": round(realized_pnl, 6), "balance": round(paper_balance, 4),
                             "hold_time": round(mb_hold, 1), "reason": mb_reason,
                         })
+                        if _tracks_live_wallet():
+                            wsnap = await wallet_chain_snapshot(force_rpc=True)
+                            trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
                         await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
                         moonbags.pop(mint, None)
                         print(f"✅ Closed {mb.name} | Bal: {paper_balance:.4f} | W/L: {wins}/{losses}")
@@ -2588,6 +2695,16 @@ async def handle_trade_event(msg):
             hold = now - pos.entry_time
             active = pos.remaining_size_sol
             pnl_sol = active * (pnl_pct / 100.0)
+            sell_ok = True
+            if MODE_LIVE:
+                sell_ok = await live_sell_pump(mint)
+                if not sell_ok:
+                    pos.closing = False
+                    _bump_counter("sell_failed_chain")
+                    warn = f"⚠ Velocity exit failed on-chain for {pos.name} ({pos.symbol}); keeping open"
+                    print(warn)
+                    await broadcast_log(warn, "warn")
+                    return
             realized_pnl += pnl_sol
             if pnl_sol >= 0:
                 wins += 1; consecutive_losses = 0
@@ -2596,7 +2713,6 @@ async def handle_trade_event(msg):
                 if pos.creator: add_to_creator_blacklist(pos.creator, pos.name)
                 if consecutive_losses >= CONFIG["cooldown_losses"]:
                     cooldown_until = now + CONFIG["cooldown_sec"]
-            if MODE_LIVE: await live_sell_pump(mint)
             paper_balance += max(active + pnl_sol, 0.0)
             log_trade(pos.entry_time, now, mint, pos.name, pos.symbol, pos.creator,
                       "SELL", active, pos.entry_price, price, pnl_sol, pnl_pct, "VelocityDump")
@@ -2604,13 +2720,20 @@ async def handle_trade_event(msg):
             print(log_msg)
             level = "exit-win" if pnl_sol >= 0 else "exit-loss"
             await broadcast_log(log_msg, level)
+            confirm_mark = "✅" if MODE_LIVE and sell_ok else ""
             trade_history.append({
                 "time": datetime.now().strftime("%H:%M:%S"), "timestamp": now * 1000,
-                "name": pos.name, "symbol": pos.symbol,
+                "name": f"{pos.name} {confirm_mark}".strip(), "symbol": pos.symbol,
                 "pnl_pct": round(pnl_pct, 2), "pnl_sol": round(pnl_sol, 6),
+                "projected_pnl_sol": round(pnl_sol, 6),
+                "execution_confirmed": bool(sell_ok),
+                "confirmation_mark": confirm_mark,
                 "cum_pnl": round(realized_pnl, 6), "balance": round(paper_balance, 4),
                 "hold_time": round(hold, 1), "reason": "VelocityDump",
             })
+            if _tracks_live_wallet():
+                wsnap = await wallet_chain_snapshot(force_rpc=True)
+                trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
             await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
             positions.pop(mint, None)
             print(f"✅ Closed {pos.name} | Bal: {paper_balance:.4f} | W/L: {wins}/{losses}")
@@ -2642,8 +2765,16 @@ async def handle_trade_event(msg):
             if pos.closing:
                 return
             pos.closing = True
+        sell_ok = True
         if MODE_LIVE:
-            await live_sell_pump(mint, "50%")
+            sell_ok = await live_sell_pump(mint, "50%")
+            if not sell_ok:
+                pos.closing = False
+                _bump_counter("sell_failed_chain")
+                warn = f"⚠ TP1 sell failed on-chain for {pos.name} ({pos.symbol}); keeping full position"
+                print(warn)
+                await broadcast_log(warn, "warn")
+                return
         partial_pnl = (pos.size_sol * 0.5) * (pnl_pct / 100.0)
         realized_pnl += partial_pnl
         pos.partial_sold = True
@@ -2653,13 +2784,20 @@ async def handle_trade_event(msg):
         log_msg = f"💰 TP1 {pos.name} ({pos.symbol}) at +{pnl_pct:.1f}%"
         print(log_msg)
         await broadcast_log(log_msg, "exit-win")
+        confirm_mark = "✅" if MODE_LIVE and sell_ok else ""
         trade_history.append({
             "time": datetime.now().strftime("%H:%M:%S"), "timestamp": now * 1000,
-            "name": pos.name, "symbol": pos.symbol,
+            "name": f"{pos.name} {confirm_mark}".strip(), "symbol": pos.symbol,
             "pnl_pct": round(pnl_pct, 2), "pnl_sol": round(partial_pnl, 6),
+            "projected_pnl_sol": round(partial_pnl, 6),
+            "execution_confirmed": bool(sell_ok),
+            "confirmation_mark": confirm_mark,
             "cum_pnl": round(realized_pnl, 6), "balance": round(paper_balance, 4),
             "hold_time": round(hold, 1), "reason": "TP1",
         })
+        if _tracks_live_wallet():
+            wsnap = await wallet_chain_snapshot(force_rpc=True)
+            trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
         await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
         await broadcast_stats()
         pos.closing = False  # unlock — TP1 is partial, position stays open
@@ -2690,8 +2828,19 @@ async def handle_trade_event(msg):
     sell_size = active * (sell_pct / 100.0)
     moonbag_size = active - sell_size if should_moonbag else 0
 
-    realized_pnl += sell_size * (pnl_pct / 100.0)
+    sell_ok = True
+    if MODE_LIVE:
+        sell_str = f"{sell_pct}%" if sell_pct < 100 else "100%"
+        sell_ok = await live_sell_pump(mint, sell_str)
+        if not sell_ok:
+            pos.closing = False
+            _bump_counter("sell_failed_chain")
+            warn = f"⚠ EXIT FAILED on-chain for {pos.name} ({pos.symbol}) | {reason} | keeping position open"
+            print(warn)
+            await broadcast_log(warn, "warn")
+            return
 
+    realized_pnl += sell_size * (pnl_pct / 100.0)
     if is_profitable:
         wins += 1
         consecutive_losses = 0
@@ -2702,10 +2851,6 @@ async def handle_trade_event(msg):
             add_to_creator_blacklist(pos.creator, pos.name)
         if consecutive_losses >= CONFIG["cooldown_losses"]:
             cooldown_until = now + CONFIG["cooldown_sec"]
-
-    if MODE_LIVE:
-        sell_str = f"{sell_pct}%" if sell_pct < 100 else "100%"
-        await live_sell_pump(mint, sell_str)
 
     paper_balance += max(sell_size + sell_size * (pnl_pct / 100.0), 0.0)
     log_trade(pos.entry_time, now, mint, pos.name, pos.symbol, pos.creator,
@@ -2718,14 +2863,21 @@ async def handle_trade_event(msg):
     level = "exit-win" if is_profitable else "exit-loss"
     await broadcast_log(log_msg, level)
 
+    confirm_mark = "✅" if MODE_LIVE and sell_ok else ""
     trade_history.append({
         "time": datetime.now().strftime("%H:%M:%S"), "timestamp": now * 1000,
-        "name": pos.name, "symbol": pos.symbol,
+        "name": f"{pos.name} {confirm_mark}".strip(), "symbol": pos.symbol,
         "pnl_pct": round(pnl_pct, 2),
         "pnl_sol": round(sell_size * (pnl_pct / 100.0), 6),
+        "projected_pnl_sol": round(sell_size * (pnl_pct / 100.0), 6),
+        "execution_confirmed": bool(sell_ok),
+        "confirmation_mark": confirm_mark,
         "cum_pnl": round(realized_pnl, 6), "balance": round(paper_balance, 4),
         "hold_time": round(hold, 1), "reason": reason + (" 🌙" if should_moonbag else ""),
     })
+    if _tracks_live_wallet():
+        wsnap = await wallet_chain_snapshot(force_rpc=True)
+        trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
     await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
     positions.pop(mint, None)
 

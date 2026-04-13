@@ -11,7 +11,7 @@ use solana_sdk::{
 };
 use std::env;
 use std::str::FromStr;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Well-known program IDs
 const COMPUTE_BUDGET_PROGRAM: &str = "ComputeBudget111111111111111111111111111111";
@@ -274,6 +274,43 @@ impl InstructionBuilder {
         (numerator / denominator) as u64
     }
 
+    /// Compute the maximum safe sell amount that won't overflow Pump.fun's on-chain u64 math.
+    ///
+    /// The program's sell path does `virtual_sol_reserves * sell_amount` in u64 (or checked u64)
+    /// and subtracts sol_output from real_sol_reserves. Both can overflow/underflow.
+    ///
+    /// Returns the capped sell amount, or the original if it's already safe.
+    pub fn safe_sell_amount(curve: &BondingCurveState, desired_sell: u64) -> u64 {
+        if curve.virtual_sol_reserves == 0 || curve.virtual_token_reserves == 0 {
+            return desired_sell;
+        }
+
+        // Guard 1: ensure virtual_sol * sell_amount fits in u64 (program uses checked u64 mul)
+        let u64_product_cap = u64::MAX / curve.virtual_sol_reserves;
+        let mut safe = desired_sell.min(u64_product_cap);
+
+        // Guard 2: ensure computed sol_output <= real_sol_reserves (prevents underflow)
+        if curve.real_sol_reserves > 0 {
+            let expected_out = Self::calculate_sell_sol(curve, safe);
+            if expected_out > curve.real_sol_reserves {
+                // Binary search for the max amount where output <= 95% of real reserves
+                let target_sol = (curve.real_sol_reserves as f64 * 0.95) as u64;
+                // Analytic: sell = target_sol * vTokens / (vSol - target_sol), if vSol > target_sol
+                if curve.virtual_sol_reserves > target_sol {
+                    let num = (target_sol as u128) * (curve.virtual_token_reserves as u128);
+                    let den = (curve.virtual_sol_reserves as u128) - (target_sol as u128);
+                    let analytic = (num / den) as u64;
+                    safe = safe.min(analytic);
+                } else {
+                    // Bonding curve almost empty — refuse to sell
+                    safe = 0;
+                }
+            }
+        }
+
+        safe
+    }
+
     /// Build a complete buy transaction.
     ///
     /// Returns `(transaction, tokens_out)` where `tokens_out` is the expected token amount
@@ -437,11 +474,11 @@ impl InstructionBuilder {
             let total_tokens = if on_chain > 0 {
                 on_chain
             } else {
-                info!(
-                    "SELL: on-chain balance 0 (lag) — using buy cache {} tokens",
+                anyhow::bail!(
+                    "On-chain token balance unavailable for {} (cache={} refused for safety)",
+                    user_ata,
                     cached
                 );
-                cached
             };
 
             if on_chain > 0 {
@@ -473,14 +510,44 @@ impl InstructionBuilder {
             anyhow::bail!("No tokens to sell for mint {}", mint);
         }
 
-        let sell_amount = if pct >= 100.0 {
-            total_tokens
+        let full_sell_haircut_units: u64 = env::var("BIGAL_SELL_FULL_HAIRCUT_UNITS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let mut sell_amount = if pct >= 100.0 {
+            if full_sell_haircut_units > 0 && total_tokens > full_sell_haircut_units {
+                total_tokens - full_sell_haircut_units
+            } else {
+                total_tokens
+            }
         } else {
             ((total_tokens as f64) * pct / 100.0) as u64
         };
 
         if sell_amount == 0 {
             anyhow::bail!("Calculated 0 tokens to sell ({}% of {})", pct, total_tokens);
+        }
+
+        // ── Overflow guard ──────────────────────────────────────────────
+        // Pump.fun's on-chain sell path uses u64 math that can overflow when
+        // sell_amount is large relative to bonding curve reserves.
+        // Cap the sell amount to prevent error 6024 (Overflow) and wasted fees.
+        let original_sell = sell_amount;
+        sell_amount = Self::safe_sell_amount(&curve_state, sell_amount);
+        if sell_amount == 0 {
+            anyhow::bail!(
+                "Bonding curve depleted (real_sol={}) — cannot sell safely",
+                curve_state.real_sol_reserves
+            );
+        }
+        if sell_amount < original_sell {
+            warn!(
+                "SELL overflow guard: capped {} → {} tokens (vSol={} rSol={} vTokens={})",
+                original_sell, sell_amount,
+                curve_state.virtual_sol_reserves,
+                curve_state.real_sol_reserves,
+                curve_state.virtual_token_reserves,
+            );
         }
 
         let expected_sol = Self::calculate_sell_sol(&curve_state, sell_amount);
@@ -536,9 +603,10 @@ impl InstructionBuilder {
         let compute_limit_ix = compute_unit_limit_ix(cu_limit);
         let compute_price_ix = compute_unit_price_ix(priority_fee);
 
-        // Build instruction list — append CloseAccount on full sells to reclaim ~0.002 SOL rent
+        // Build instruction list — append CloseAccount only when truly selling all tokens.
+        // If haircut leaves dust, close_account would fail and revert the whole tx.
         let mut ixs = vec![compute_limit_ix, compute_price_ix, sell_ix];
-        if pct >= 100.0 {
+        if sell_amount == total_tokens {
             ixs.push(close_account_ix(&user_ata, &user, &user));
             debug!("SELL 100%: appending CloseAccount for rent recovery on {}", user_ata);
         }

@@ -220,4 +220,39 @@ impl RpcClient {
         let _ = self.call("getHealth", serde_json::json!([])).await;
         Ok(())
     }
+
+    /// Get signature status via `getSignatureStatuses`.
+    ///
+    /// Returns `(confirmation_status, err_json)` when found, else `None`.
+    pub async fn get_signature_status(
+        &self,
+        signature: &str,
+        search_history: bool,
+    ) -> Result<Option<(Option<String>, Option<serde_json::Value>)>> {
+        let result = self
+            .call(
+                "getSignatureStatuses",
+                serde_json::json!([
+                    [signature],
+                    {"searchTransactionHistory": search_history}
+                ]),
+            )
+            .await?;
+
+        let val = result["value"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if val.is_null() {
+            return Ok(None);
+        }
+
+        let confirmation = val
+            .get("confirmationStatus")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let err = val.get("err").cloned();
+        Ok(Some((confirmation, err)))
+    }
 }

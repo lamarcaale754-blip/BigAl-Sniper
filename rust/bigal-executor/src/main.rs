@@ -433,22 +433,50 @@ async fn handle_buy(
 
     match race_land_submit(jito_fut, rpc_fut, "jito", "rpc").await {
         Ok((sig_or_id, method)) => {
+            let mut tx_ref = sig_or_id.clone();
+            let mut method_ref = method.to_string();
+            if !looks_like_tx_signature(&tx_ref) {
+                if let Ok(rpc_sig) = JitoBundler::send_via_rpc(builder.rpc(), &tx).await {
+                    tx_ref = rpc_sig;
+                    method_ref = "jito+rpc".to_string();
+                }
+            }
+            if looks_like_tx_signature(&tx_ref) {
+                if let Err(e) = await_chain_confirmation(
+                    builder.rpc(),
+                    &tx_ref,
+                    trade_confirm_timeout_secs(),
+                    require_finalized(),
+                )
+                .await
+                {
+                    return TradeResult::failed(signal.id, format!("BUY chain confirm failed: {}", e));
+                }
+            } else {
+                return TradeResult::failed(
+                    signal.id,
+                    format!(
+                        "BUY landed via {} but no tx signature to verify ({})",
+                        method_ref, tx_ref
+                    ),
+                );
+            }
             let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
 
             // Cache expected token balance for fast sell
             balance_cache.insert(mint, tokens_out);
 
-            let tip_used = if method == "jito" { tip } else { 0 };
+            let tip_used = if method_ref.contains("jito") { tip } else { 0 };
             info!(
                 "BUY confirmed via {} | mint={} | {:.3} SOL | ~{} tokens cached | fee={} tip={} | {} | total={:.0}ms",
-                method, signal.mint, signal.amount, tokens_out, priority_fee, tip_used, sig_or_id, total_ms
+                method_ref, signal.mint, signal.amount, tokens_out, priority_fee, tip_used, tx_ref, total_ms
             );
 
             TradeResult::confirmed(
                 signal.id,
-                sig_or_id,
-                method.to_string(),
+                tx_ref,
+                method_ref,
                 LatencyInfo {
                     zmq_recv_ms,
                     build_ms,
@@ -488,6 +516,74 @@ fn blockhash_max_age_secs() -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(40)
+}
+
+fn trade_confirm_timeout_secs() -> u64 {
+    std::env::var("BIGAL_CONFIRM_TIMEOUT_SEC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(14)
+}
+
+fn require_finalized() -> bool {
+    std::env::var("BIGAL_REQUIRE_FINALIZED")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn looks_like_tx_signature(s: &str) -> bool {
+    (80..=100).contains(&s.len())
+        && s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() && !"0OIl".contains(c))
+}
+
+/// Returns true if the error message indicates a permanent on-chain failure
+/// that won't be fixed by retrying the same transaction parameters.
+fn is_permanent_chain_error(err_msg: &str) -> bool {
+    let lower = err_msg.to_ascii_lowercase();
+    // 6024 / 0x1788 = Overflow in Pump.fun sell math
+    // 3012 = AccountNotInitialized (ATA doesn't exist — buy didn't land)
+    // "depleted" = our own overflow guard rejection
+    lower.contains("overflow")
+        || lower.contains("6024")
+        || lower.contains("0x1788")
+        || lower.contains("accountnotinitialized")
+        || lower.contains("3012")
+        || lower.contains("depleted")
+        || lower.contains("insufficient funds")
+        || lower.contains("insufficient lamports")
+}
+
+async fn await_chain_confirmation(
+    rpc: &rpc::RpcClient,
+    signature: &str,
+    timeout_secs: u64,
+    finalized: bool,
+) -> Result<()> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while Instant::now() < deadline {
+        if let Some((status, err)) = rpc.get_signature_status(signature, true).await? {
+            if let Some(e) = err {
+                if !e.is_null() {
+                    anyhow::bail!("on-chain tx failed: {}", e);
+                }
+            }
+            if finalized {
+                if status.as_deref() == Some("finalized") {
+                    return Ok(());
+                }
+            } else if matches!(status.as_deref(), Some("confirmed") | Some("finalized")) {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+    }
+    anyhow::bail!(
+        "tx not {} within {}s",
+        if finalized { "finalized" } else { "confirmed" },
+        timeout_secs
+    );
 }
 
 /// Handle a sell signal.
@@ -571,6 +667,13 @@ async fn handle_sell(
         {
             Ok(x) => x,
             Err(e) => {
+                let err_str = format!("{}", e);
+                // Don't retry permanent build errors (depleted curve, zero balance after all retries)
+                if is_permanent_chain_error(&err_str) {
+                    error!("SELL build permanent failure: {}", err_str);
+                    balance_cache.remove(&mint);
+                    return TradeResult::failed(signal.id, format!("Build failed: {}", e));
+                }
                 if attempt < 3 {
                     warn!(
                         "SELL build attempt {} failed: {}, retrying fresh (no cache)",
@@ -602,21 +705,70 @@ async fn handle_sell(
 
         match land_result {
             Ok((sig_or_id, method)) => {
+                let mut tx_ref = sig_or_id.clone();
+                let mut method_ref = method.to_string();
+                if !looks_like_tx_signature(&tx_ref) {
+                    if let Ok(rpc_sig) = JitoBundler::send_via_rpc_fast(builder.rpc(), &tx).await {
+                        tx_ref = rpc_sig;
+                        method_ref = "jito+rpc".to_string();
+                    }
+                }
+                if looks_like_tx_signature(&tx_ref) {
+                    if let Err(e) = await_chain_confirmation(
+                        builder.rpc(),
+                        &tx_ref,
+                        trade_confirm_timeout_secs(),
+                        require_finalized(),
+                    )
+                    .await
+                    {
+                        last_failure = format!("SELL chain confirm failed: {}", e);
+                        error!("SELL chain confirm failed attempt {} | {}", attempt, last_failure);
+
+                        // Don't retry permanent on-chain errors (Overflow, AccountNotInitialized, etc.)
+                        // Retrying the same amount will just burn more priority fees.
+                        if is_permanent_chain_error(&last_failure) {
+                            error!("SELL permanent chain error — not retrying: {}", last_failure);
+                            balance_cache.remove(&mint);
+                            break;
+                        }
+
+                        if attempt < 3 {
+                            let ms = sell_retry_stagger_ms();
+                            if ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                            }
+                            continue;
+                        }
+                        break;
+                    }
+                } else {
+                    last_failure = format!("SELL landed via {} but no tx signature to verify ({})", method_ref, tx_ref);
+                    error!("SELL unverifiable attempt {} | {}", attempt, last_failure);
+                    if attempt < 3 {
+                        let ms = sell_retry_stagger_ms();
+                        if ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        }
+                        continue;
+                    }
+                    break;
+                }
                 let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
 
                 balance_cache.remove(&mint);
 
-                let tip_used = if method == "jito" { tip } else { 0 };
+                let tip_used = if method_ref.contains("jito") { tip } else { 0 };
                 info!(
                     "SELL confirmed via {} | mint={} | {}% | fee={} tip={} | {} | total={:.0}ms | attempt={}",
-                    method, signal.mint, pct, priority_fee, tip_used, sig_or_id, total_ms, attempt
+                    method_ref, signal.mint, pct, priority_fee, tip_used, tx_ref, total_ms, attempt
                 );
 
                 return TradeResult::confirmed(
                     signal.id,
-                    sig_or_id,
-                    method.to_string(),
+                    tx_ref,
+                    method_ref,
                     LatencyInfo {
                         zmq_recv_ms,
                         build_ms,
