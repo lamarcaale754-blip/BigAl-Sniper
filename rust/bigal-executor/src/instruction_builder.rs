@@ -71,6 +71,15 @@ fn close_account_ix(account: &Pubkey, destination: &Pubkey, owner: &Pubkey) -> I
 const BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 const CREATE_DISCRIMINATOR: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
+
+/// Pump.fun fee program (pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ)
+const FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
+
+/// fee_config PDA second seed (32-byte constant from IDL)
+const FEE_CONFIG_SEED_CONST: [u8; 32] = [
+    1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104, 191, 23, 91, 170,
+    81, 137, 203, 151, 245, 210, 255, 59, 101, 93, 43, 182, 253, 109, 24, 176,
+];
 const METAPLEX_METADATA_PROGRAM: &str = "metaqbxxUoLd1PNsHi4FpQRVKuoLY1U8kbBhtNNTfPAv";
 
 /// Create instruction data (Anchor-encoded: discriminator + borsh-serialized args)
@@ -91,13 +100,14 @@ pub struct BondingCurveState {
     pub real_sol_reserves: u64,
     pub token_total_supply: u64,
     pub complete: bool,
+    pub creator: Pubkey,
 }
 
 impl BondingCurveState {
     /// Deserialize from raw account data (skip 8-byte Anchor discriminator)
     fn from_account_data(data: &[u8]) -> Result<Self> {
-        if data.len() < 49 {
-            anyhow::bail!("Bonding curve data too small: {} bytes", data.len());
+        if data.len() < 73 {
+            anyhow::bail!("Bonding curve data too small: {} bytes (need >=73)", data.len());
         }
         let d = &data[8..]; // skip discriminator
         Ok(BondingCurveState {
@@ -107,6 +117,8 @@ impl BondingCurveState {
             real_sol_reserves: u64::from_le_bytes(d[24..32].try_into()?),
             token_total_supply: u64::from_le_bytes(d[32..40].try_into()?),
             complete: d[40] != 0,
+            creator: Pubkey::try_from(&d[41..73])
+                .map_err(|_| anyhow::anyhow!("Invalid creator pubkey in bonding curve"))?,
         })
     }
 }
@@ -169,6 +181,43 @@ impl InstructionBuilder {
     /// Derive the bonding curve PDA for a given mint
     pub fn derive_bonding_curve(&self, mint: &Pubkey) -> (Pubkey, u8) {
         Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &self.program_id)
+    }
+
+    /// Derive creator_vault PDA: seeds = ["creator-vault", creator_pubkey]
+    fn derive_creator_vault(&self, creator: &Pubkey) -> Pubkey {
+        let (pda, _) = Pubkey::find_program_address(
+            &[b"creator-vault", creator.as_ref()],
+            &self.program_id,
+        );
+        pda
+    }
+
+    /// Derive global_volume_accumulator PDA: seeds = ["global_volume_accumulator"]
+    fn derive_global_volume_accumulator(&self) -> Pubkey {
+        let (pda, _) = Pubkey::find_program_address(
+            &[b"global_volume_accumulator"],
+            &self.program_id,
+        );
+        pda
+    }
+
+    /// Derive user_volume_accumulator PDA: seeds = ["user_volume_accumulator", user_pubkey]
+    fn derive_user_volume_accumulator(&self, user: &Pubkey) -> Pubkey {
+        let (pda, _) = Pubkey::find_program_address(
+            &[b"user_volume_accumulator", user.as_ref()],
+            &self.program_id,
+        );
+        pda
+    }
+
+    /// Derive fee_config PDA: seeds = ["fee_config", <32-byte constant>] under fee program
+    fn derive_fee_config() -> Pubkey {
+        let fee_program = Pubkey::from_str(FEE_PROGRAM_ID).unwrap();
+        let (pda, _) = Pubkey::find_program_address(
+            &[b"fee_config", &FEE_CONFIG_SEED_CONST],
+            &fee_program,
+        );
+        pda
     }
 
     /// Get the associated token account address
@@ -262,21 +311,29 @@ impl InstructionBuilder {
         let ix_bytes = borsh::to_vec(&ix_data)?;
 
         let token_program = Pubkey::from_str(config::TOKEN_PROGRAM_ID)?;
-        let rent_sysvar = Pubkey::from_str(config::RENT_SYSVAR_ID)?;
+        let fee_program = Pubkey::from_str(FEE_PROGRAM_ID)?;
+        let creator_vault = self.derive_creator_vault(&curve_state.creator);
+        let global_vol_acc = self.derive_global_volume_accumulator();
+        let user_vol_acc = self.derive_user_volume_accumulator(&user);
+        let fee_config = Self::derive_fee_config();
 
         let accounts = vec![
-            AccountMeta::new_readonly(self.global_config, false),
-            AccountMeta::new(self.fee_recipient, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new(bonding_curve, false),
-            AccountMeta::new(assoc_bonding_curve, false),
-            AccountMeta::new(user_ata, false),
-            AccountMeta::new(user, true),
-            AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM).unwrap(), false),
-            AccountMeta::new_readonly(token_program, false),
-            AccountMeta::new_readonly(rent_sysvar, false),
-            AccountMeta::new_readonly(self.event_authority, false),
-            AccountMeta::new_readonly(self.program_id, false),
+            AccountMeta::new_readonly(self.global_config, false),     // 0  global
+            AccountMeta::new(self.fee_recipient, false),              // 1  fee_recipient
+            AccountMeta::new_readonly(*mint, false),                  // 2  mint
+            AccountMeta::new(bonding_curve, false),                   // 3  bonding_curve
+            AccountMeta::new(assoc_bonding_curve, false),             // 4  associated_bonding_curve
+            AccountMeta::new(user_ata, false),                        // 5  associated_user
+            AccountMeta::new(user, true),                             // 6  user
+            AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM).unwrap(), false), // 7 system
+            AccountMeta::new_readonly(token_program, false),          // 8  token_program
+            AccountMeta::new(creator_vault, false),                   // 9  creator_vault
+            AccountMeta::new_readonly(self.event_authority, false),   // 10 event_authority
+            AccountMeta::new_readonly(self.program_id, false),        // 11 program
+            AccountMeta::new_readonly(global_vol_acc, false),         // 12 global_volume_accumulator
+            AccountMeta::new(user_vol_acc, false),                    // 13 user_volume_accumulator
+            AccountMeta::new_readonly(fee_config, false),             // 14 fee_config
+            AccountMeta::new_readonly(fee_program, false),            // 15 fee_program
         ];
 
         let buy_ix = Instruction::new_with_bytes(self.program_id, &ix_bytes, accounts);
@@ -427,21 +484,25 @@ impl InstructionBuilder {
         let ix_bytes = borsh::to_vec(&ix_data)?;
 
         let token_program = Pubkey::from_str(config::TOKEN_PROGRAM_ID)?;
-        let ata_program = Pubkey::from_str(config::ASSOCIATED_TOKEN_PROGRAM_ID)?;
+        let fee_program = Pubkey::from_str(FEE_PROGRAM_ID)?;
+        let creator_vault = self.derive_creator_vault(&curve_state.creator);
+        let fee_config = Self::derive_fee_config();
 
         let accounts = vec![
-            AccountMeta::new_readonly(self.global_config, false),
-            AccountMeta::new(self.fee_recipient, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new(bonding_curve, false),
-            AccountMeta::new(assoc_bonding_curve, false),
-            AccountMeta::new(user_ata, false),
-            AccountMeta::new(user, true),
-            AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM).unwrap(), false),
-            AccountMeta::new_readonly(ata_program, false),
-            AccountMeta::new_readonly(token_program, false),
-            AccountMeta::new_readonly(self.event_authority, false),
-            AccountMeta::new_readonly(self.program_id, false),
+            AccountMeta::new_readonly(self.global_config, false),     // 0  global
+            AccountMeta::new(self.fee_recipient, false),              // 1  fee_recipient
+            AccountMeta::new_readonly(*mint, false),                  // 2  mint
+            AccountMeta::new(bonding_curve, false),                   // 3  bonding_curve
+            AccountMeta::new(assoc_bonding_curve, false),             // 4  associated_bonding_curve
+            AccountMeta::new(user_ata, false),                        // 5  associated_user
+            AccountMeta::new(user, true),                             // 6  user
+            AccountMeta::new_readonly(Pubkey::from_str(SYSTEM_PROGRAM).unwrap(), false), // 7 system
+            AccountMeta::new(creator_vault, false),                   // 8  creator_vault
+            AccountMeta::new_readonly(token_program, false),          // 9  token_program
+            AccountMeta::new_readonly(self.event_authority, false),   // 10 event_authority
+            AccountMeta::new_readonly(self.program_id, false),        // 11 program
+            AccountMeta::new_readonly(fee_config, false),             // 12 fee_config
+            AccountMeta::new_readonly(fee_program, false),            // 13 fee_program
         ];
 
         let sell_ix = Instruction::new_with_bytes(self.program_id, &ix_bytes, accounts);
