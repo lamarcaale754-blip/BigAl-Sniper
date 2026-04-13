@@ -120,10 +120,11 @@ class ZmqBridge:
         """Background thread: reads execution results from Rust SUB socket."""
         poller = zmq.Poller()
         poller.register(self._sub, zmq.POLLIN)
+        poll_ms = int(os.environ.get("ZMQ_POLL_TIMEOUT_MS", "10"))
 
         while self._running:
             try:
-                socks = dict(poller.poll(timeout=500))  # 500ms poll
+                socks = dict(poller.poll(timeout=poll_ms))
                 if self._sub in socks:
                     msg = self._sub.recv_string(zmq.NOBLOCK)
                     result = json.loads(msg)

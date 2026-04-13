@@ -71,8 +71,11 @@ impl JitoBundler {
         }
 
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(12))
-            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(4))
+            .tcp_keepalive(Duration::from_secs(20))
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .expect("reqwest client build (Jito)");
 
@@ -310,6 +313,15 @@ impl JitoBundler {
         rpc.send_transaction(tx).await
             .context("RPC send_and_confirm failed")
     }
+
+    /// Fast RPC path for time-critical sells: maxRetries=0, base64 encoding.
+    pub async fn send_via_rpc_fast(
+        rpc: &crate::rpc::RpcClient,
+        tx: &Transaction,
+    ) -> Result<String> {
+        rpc.send_transaction_fast(tx).await
+            .context("RPC send_transaction_fast failed")
+    }
 }
 
 /// Race Jito bundle submission against direct RPC; same signed tx → chain dedupes.
@@ -317,7 +329,7 @@ impl JitoBundler {
 /// `jito_method` / `rpc_method` are returned to Python (e.g. `"jito"` vs `"rpc"`, or
 /// `"jito_kill"` / `"rpc_kill"` for kill chain).
 ///
-/// Bounded by `BIGAL_LAND_TIMEOUT_SEC` (default 28). Uses `biased` polling so RPC is
+/// Bounded by `BIGAL_LAND_TIMEOUT_SEC` (default 8). Uses `biased` polling so RPC is
 /// checked first when both complete — more `rpc` wins when timings are similar.
 pub async fn race_land_submit(
     jito_fut: impl std::future::Future<Output = Result<String>> + Send,
@@ -328,7 +340,7 @@ pub async fn race_land_submit(
     let secs: u64 = std::env::var("BIGAL_LAND_TIMEOUT_SEC")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(28);
+        .unwrap_or(8);
     let land_deadline = Duration::from_secs(secs);
 
     tokio::time::timeout(land_deadline, async {

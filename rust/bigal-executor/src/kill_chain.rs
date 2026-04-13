@@ -45,7 +45,9 @@ pub async fn execute_kill(
 
     // Use caches for maximum speed on kill chain
     let cached_bal = balance_cache.get(mint);
-    let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, 30).await;
+    let max_age: u64 = std::env::var("BIGAL_BLOCKHASH_MAX_AGE_SEC")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, max_age).await;
 
     // Step 1: Build sell-all transaction (100% of holdings) + blockhash aligned with sell signature
     let (sell_tx, tip_blockhash) = match builder.build_sell(

@@ -16,12 +16,16 @@ Sell path tuning (reliability first; sub-second retries, no multi-second backoff
   ZMQ_SELL_RETRY_ON_TIMEOUT — if 1, ZMQ timeout → immediate retry (default 0: short cooldown so in-flight txs can land).
 Rust executor: balance cache from buy + parallel RPC + dual Jito+RPC racing handle most latency.
   HELIUS_READ_RPC_URL — dedicated Helius HTTP URL for token balance polls.
-  BIGAL_SELL_BALANCE_RETRIES / BIGAL_SELL_BALANCE_POLL_MS — fallback patience when cache misses (defaults 20 / 200ms).
+  BIGAL_SELL_BALANCE_RETRIES / BIGAL_SELL_BALANCE_POLL_MS — fallback patience when cache misses (defaults 8 / 80ms).
   ZMQ_SELL_WAIT_SEC — max wait per Rust sell round-trip (default 45; must exceed land+build).
   ZMQ_SELL_PREFLIGHT_MS — optional sleep before first sell (default 0).
   BIGAL_SELL_TIP_MULT — multiply resolved priority fee for sells only (default 1.0 = same as strategy; raise e.g. 1.15 for harder exits).
   BIGAL_SELL_RPC_ONLY — if true/1, Rust sells use RPC only (log always shows SELL via rpc).
-  BIGAL_LAND_TIMEOUT_SEC — max seconds for Jito+RPC land race in Rust (default 28).
+  BIGAL_LAND_TIMEOUT_SEC — max seconds for Jito+RPC land race in Rust (default 8).
+  BIGAL_SELL_RETRY_STAGGER_MS — Rust sell land retry pause (default 0 = immediate).
+  BIGAL_SELL_BUILD_RETRY_MS — Rust sell build retry pause (default 50ms).
+  BIGAL_BLOCKHASH_MAX_AGE_SEC — max blockhash cache age (default 40; Solana TTL ~60s).
+  BIGAL_RPC_TIMEOUT_SEC / BIGAL_RPC_CONNECT_TIMEOUT_SEC — RPC HTTP timeouts (defaults 8 / 4s).
 """
 
 import asyncio
@@ -38,11 +42,10 @@ from strategy_mode import resolve_parameters, AdaptiveState
 DEFAULT_ZMQ_SIGNAL_IPC = "ipc:///tmp/bigal_signal.ipc"
 DEFAULT_ZMQ_RESULT_IPC = "ipc:///tmp/bigal_result.ipc"
 
-# Rust sell attempts before Legacy (each attempt is a full ZMQ round-trip).
-# Reduced defaults: Rust now handles balance caching, parallel fetches, and dual
-# Jito+RPC submission internally, so Python needs far fewer retries.
-# Override via env vars if needed (e.g. ZMQ_SELL_RUST_ATTEMPTS=8 for old behavior).
-_RUST_SELL_ATTEMPTS = max(1, int(os.environ.get("ZMQ_SELL_RUST_ATTEMPTS", "3")))
+# Rust sell attempts per live_sell_pump() call. Each attempt = full ZMQ round-trip
+# (Rust internally does 3 build+land cycles per attempt). Default 2: keeps each
+# call bounded (~16-20s max) while live_sell_pump retries the outer loop until filled.
+_RUST_SELL_ATTEMPTS = max(1, int(os.environ.get("ZMQ_SELL_RUST_ATTEMPTS", "2")))
 _RUST_SELL_BACKOFF_MAX = float(os.environ.get("ZMQ_SELL_BACKOFF_MAX", "0.85"))
 _ZMQ_SELL_WAIT_SEC = float(os.environ.get("ZMQ_SELL_WAIT_SEC", "45"))
 _ZMQ_SELL_PREFLIGHT_MS = max(0, int(os.environ.get("ZMQ_SELL_PREFLIGHT_MS", "0")))
@@ -291,7 +294,8 @@ class LegacyExecutor(ExecutorBackend):
 
 class ZmqExecutor(ExecutorBackend):
     """Sends trade signals to Rust executor via ZeroMQ.
-    Falls back to LegacyExecutor if Rust is not responding."""
+    Legacy fallback disabled for buy/sell/kill — its 15% slippage destroys PnL.
+    Legacy is only used for get_balance() (not latency-critical)."""
 
     name = "zmq_rust"
 
@@ -408,9 +412,8 @@ class ZmqExecutor(ExecutorBackend):
             return sig
 
         self._log_rust_rejection("buy", result)
-        if self._fallback:
-            print("[ZmqExecutor] Falling back to legacy executor (buy)")
-            return await self._fallback.buy(mint, size_sol, slippage, priority_fee)
+        # No Legacy fallback — Rust path has better slippage and Jito protection.
+        print("[ZmqExecutor] BUY FAILED via Rust — skipping (no Legacy fallback)")
         return None
 
     async def sell(self, mint, pct, slippage, priority_fee, keypair_b58=None):
@@ -465,12 +468,12 @@ class ZmqExecutor(ExecutorBackend):
                 return sig
 
         self._log_rust_rejection("sell", last_result)
-        if self._fallback:
-            print(
-                "[ZmqExecutor] Legacy sell fallback after "
-                f"{_RUST_SELL_ATTEMPTS} Rust attempt(s) (should be rare)"
-            )
-            return await self._fallback.sell(mint, pct, slippage, priority_fee)
+        # Never fall back to Legacy for sells — its 15% slippage destroys PnL.
+        # If Rust fails 3 times the position stays open for the next monitor cycle.
+        print(
+            f"[ZmqExecutor] SELL FAILED after {_RUST_SELL_ATTEMPTS} Rust attempt(s) — "
+            "no Legacy fallback (would destroy PnL with 15% slippage)"
+        )
         return None
 
     async def get_balance(self):
@@ -517,9 +520,7 @@ class ZmqExecutor(ExecutorBackend):
             print(f"[ZmqExecutor] KILL via {method} in {lat:.0f}ms: {sig}")
             return sig
         self._log_rust_rejection("kill", result)
-        if self._fallback:
-            print("[ZmqExecutor] Kill failed, falling back to legacy 100% sell")
-            return await self._fallback.sell(mint, "100%", 15, 0.01)
+        print("[ZmqExecutor] KILL FAILED via Rust — no Legacy fallback")
         return None
 
     def is_connected(self):

@@ -1,9 +1,13 @@
-//! Yellowstone Geyser gRPC → ZMQ bridge, aligned with BigAl + [rpcpool/yellowstone-grpc](https://github.com/rpcpool/yellowstone-grpc).
+//! Streaming observers → ZMQ bridge (sidecar-compatible JSON for Python `grpc_zmq_listener`).
 //!
-//! - **Env**: `GRPC_ENDPOINT`, `GRPC_X_TOKEN` (same as dashboard / Helius Geyser).
-//! - **Out**: JSON on `ZMQ_YELLOWSTONE_IPC` matching `sidecar/sidecar_grpc.js` so Python `grpc_zmq_listener` works unchanged.
-//! - **Build**: `cargo build --release --features grpc` (Linux server recommended).
-//! - **TLS / ping**: HTTPS endpoints use native roots; server `Ping` updates are answered per Triton docs (load balancers).
+//! Two backends (feature-gated, mutually exclusive at runtime — LaserStream preferred):
+//!
+//! **LaserStream** (`--features laserstream`): Helius native Rust client, 4x faster than Yellowstone,
+//! auto-reconnect + slot replay, replaces the Node.js sidecar entirely.
+//! Env: `LASERSTREAM_API_KEY` (or `HELIUS_API_KEY`), `LASERSTREAM_ENDPOINT`.
+//!
+//! **Yellowstone gRPC** (`--features grpc`): Standard Geyser client.
+//! Env: `GRPC_ENDPOINT`, `GRPC_X_TOKEN`.
 
 use zeromq::PubSocket;
 
@@ -269,5 +273,220 @@ pub async fn start_grpc_observer(
 ) -> anyhow::Result<()> {
     anyhow::bail!(
         "bigal-executor was built without Yellowstone; rebuild with: cargo build --release --features grpc"
+    );
+}
+
+// ─────────────────────────────────────────────
+//  Helius LaserStream — native Rust, 4x faster than Yellowstone, auto-reconnect.
+//  Build: cargo build --release --features laserstream
+//  Replaces the Node.js sidecar (sidecar/sidecar_grpc.js) entirely.
+// ─────────────────────────────────────────────
+
+/// Start LaserStream observer — streams Pump.fun txs and forwards sidecar-compatible JSON via ZMQ.
+#[cfg(feature = "laserstream")]
+pub async fn start_laserstream_observer(
+    api_key: &str,
+    endpoint: &str,
+    program_id: &str,
+    zmq_pub: std::sync::Arc<tokio::sync::Mutex<PubSocket>>,
+) -> anyhow::Result<()> {
+    use helius_laserstream::{subscribe, LaserstreamConfig, ChannelOptions};
+    use helius_laserstream::grpc::{
+        subscribe_update::UpdateOneof,
+        SubscribeRequest, SubscribeRequestFilterTransactions, CommitmentLevel,
+    };
+    use futures::StreamExt;
+    use zeromq::{SocketSend, ZmqMessage};
+    use std::collections::HashMap;
+    use std::str::FromStr;
+    use tracing::{info, warn, debug};
+
+    let pump_program = program_id.to_string();
+    let pump_bytes: [u8; 32] = solana_sdk::pubkey::Pubkey::from_str(program_id)?.to_bytes();
+
+    let config = LaserstreamConfig {
+        api_key: api_key.to_string(),
+        endpoint: endpoint.to_string(),
+        replay: true,
+        max_reconnect_attempts: Some(240),
+        channel_options: ChannelOptions {
+            tcp_nodelay: Some(true),
+            tcp_keepalive_secs: Some(15),
+            keep_alive_while_idle: Some(true),
+            http2_keep_alive_interval_secs: Some(15),
+            ..Default::default()
+        },
+    };
+
+    let mut transactions = HashMap::new();
+    transactions.insert(
+        "bigal_pump".to_string(),
+        SubscribeRequestFilterTransactions {
+            vote: Some(false),
+            failed: Some(false),
+            account_include: vec![pump_program.clone()],
+            ..Default::default()
+        },
+    );
+
+    let request = SubscribeRequest {
+        transactions,
+        commitment: Some(CommitmentLevel::Processed as i32),
+        ..Default::default()
+    };
+
+    info!(
+        "LaserStream connecting | endpoint={} | program={}",
+        endpoint, pump_program
+    );
+
+    let (mut stream, _handle) = subscribe(config, request);
+
+    // Pump.fun discriminators
+    const DISC_CREATE: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
+    const DISC_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+    const DISC_SELL: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(update) => {
+                let oneof = match update.update_oneof {
+                    Some(o) => o,
+                    None => continue,
+                };
+                if let UpdateOneof::Transaction(tx) = oneof {
+                    let slot = tx.slot;
+                    let info = match tx.transaction.as_ref() {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    let inner = match info.transaction.as_ref() {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    let msg = match inner.message.as_ref() {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    let meta = info.meta.as_ref();
+
+                    // Resolve account keys (including v0 loaded addresses)
+                    let mut keys: Vec<Vec<u8>> = msg.account_keys.clone();
+                    if msg.versioned {
+                        if let Some(m) = meta {
+                            keys.extend(m.loaded_writable_addresses.iter().cloned());
+                            keys.extend(m.loaded_readonly_addresses.iter().cloned());
+                        }
+                    }
+
+                    // Find Pump.fun instructions
+                    for ix in &msg.instructions {
+                        let pidx = ix.program_id_index as usize;
+                        let prog = match keys.get(pidx) {
+                            Some(p) if p.len() == 32 && p.as_slice() == pump_bytes.as_slice() => p,
+                            _ => continue,
+                        };
+                        let data = &ix.data;
+                        if data.len() < 8 { continue; }
+                        let disc: [u8; 8] = match data[0..8].try_into() {
+                            Ok(d) => d,
+                            Err(_) => continue,
+                        };
+
+                        let tx_type = if disc == DISC_CREATE { "create" }
+                            else if disc == DISC_BUY { "buy" }
+                            else if disc == DISC_SELL { "sell" }
+                            else { continue };
+
+                        let key_b58 = |idx: usize| -> Option<String> {
+                            keys.get(idx).map(|b| bs58::encode(b).into_string())
+                        };
+                        let ix_idx = |pos: usize| -> Option<usize> {
+                            ix.accounts.get(pos).map(|b| *b as usize)
+                        };
+
+                        let (mint, trader) = if tx_type == "create" {
+                            match (ix_idx(0).and_then(&key_b58), ix_idx(7).and_then(&key_b58)) {
+                                (Some(m), Some(t)) => (m, t),
+                                _ => continue,
+                            }
+                        } else {
+                            match (ix_idx(2).and_then(&key_b58), ix_idx(6).and_then(&key_b58)) {
+                                (Some(m), Some(t)) => (m, t),
+                                _ => continue,
+                            }
+                        };
+
+                        // SOL amount from balance diff
+                        let mut sol_amount = 0.0_f64;
+                        let mut v_sol_bc = 0.0_f64;
+                        if let Some(m) = meta {
+                            if let Some(ti) = keys.iter().position(|k| k.len() == 32 && bs58::encode(k).into_string() == trader) {
+                                if ti < m.pre_balances.len() && ti < m.post_balances.len() {
+                                    let d = m.post_balances[ti] as i128 - m.pre_balances[ti] as i128;
+                                    sol_amount = (d.unsigned_abs() as f64) / 1e9;
+                                }
+                            }
+                            let bc_idx = if tx_type == "create" { ix_idx(2) } else { ix_idx(3) };
+                            if let Some(bi) = bc_idx {
+                                if bi < m.post_balances.len() {
+                                    v_sol_bc = m.post_balances[bi] as f64 / 1e9;
+                                }
+                            }
+                        }
+
+                        // Token balance from post_token_balances
+                        let mut v_tokens = 0.0_f64;
+                        if let Some(m) = meta {
+                            for tb in &m.post_token_balances {
+                                if tb.mint == mint {
+                                    if let Some(s) = tb.ui_token_amount.as_ref()
+                                        .and_then(|u| u.ui_amount_string.parse::<f64>().ok())
+                                    {
+                                        if s > v_tokens { v_tokens = s; }
+                                    }
+                                }
+                            }
+                        }
+
+                        let json = serde_json::json!({
+                            "txType": tx_type,
+                            "mint": mint,
+                            "traderPublicKey": trader,
+                            "solAmount": sol_amount,
+                            "vSolInBondingCurve": v_sol_bc,
+                            "vTokensInBondingCurve": v_tokens,
+                            "slot": slot,
+                            "_source": "laserstream",
+                        });
+
+                        let line = json.to_string();
+                        let mut sock = zmq_pub.lock().await;
+                        if let Err(e) = sock.send(ZmqMessage::from(line)).await {
+                            debug!("LaserStream ZMQ send failed: {}", e);
+                        }
+                        break; // one pump ix per tx
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("LaserStream stream error: {} (auto-reconnecting)", e);
+            }
+        }
+    }
+
+    warn!("LaserStream stream ended");
+    Ok(())
+}
+
+#[cfg(not(feature = "laserstream"))]
+pub async fn start_laserstream_observer(
+    _api_key: &str,
+    _endpoint: &str,
+    _program_id: &str,
+    _zmq_pub: std::sync::Arc<tokio::sync::Mutex<PubSocket>>,
+) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "bigal-executor was built without LaserStream; rebuild with: cargo build --release --features laserstream"
     );
 }

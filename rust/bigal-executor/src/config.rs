@@ -57,6 +57,12 @@ pub struct Config {
     /// gRPC auth token
     pub grpc_x_token: Option<String>,
 
+    /// Helius LaserStream API key (`HELIUS_API_KEY` or `LASERSTREAM_API_KEY`)
+    pub laserstream_api_key: Option<String>,
+
+    /// LaserStream endpoint (default: US-East EWR)
+    pub laserstream_endpoint: Option<String>,
+
     /// Jito block engine URL
     pub jito_block_engine: String,
 
@@ -111,6 +117,12 @@ impl Config {
 
         let grpc_endpoint = env::var("GRPC_ENDPOINT").ok().filter(|s| !s.is_empty());
         let grpc_x_token = env::var("GRPC_X_TOKEN").ok().filter(|s| !s.is_empty());
+
+        let laserstream_api_key = env::var("LASERSTREAM_API_KEY")
+            .or_else(|_| env::var("HELIUS_API_KEY"))
+            .ok()
+            .filter(|s| !s.is_empty());
+        let laserstream_endpoint = env::var("LASERSTREAM_ENDPOINT").ok().filter(|s| !s.is_empty());
 
         let jito_block_engine = env::var("JITO_BLOCK_ENGINE")
             .unwrap_or_else(|_| DEFAULT_JITO_BLOCK_ENGINE.to_string());
@@ -167,6 +179,8 @@ impl Config {
             keypair,
             grpc_endpoint,
             grpc_x_token,
+            laserstream_api_key,
+            laserstream_endpoint,
             jito_block_engine,
             jito_bundle_url,
             zmq_signal_port,
