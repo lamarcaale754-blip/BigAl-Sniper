@@ -73,6 +73,7 @@ get_param() {
 cat > /opt/bigal/.env << EOF
 HELIUS_RPC_URL=$$(get_param HELIUS_RPC_URL)
 HELIUS_API_KEY=$$(get_param HELIUS_API_KEY)
+HELIUS_READ_RPC_URL=$$(get_param HELIUS_RPC_URL)
 BIGAL_PRIVATE_KEY=$$(get_param BIGAL_PRIVATE_KEY)
 JITO_BLOCK_ENGINE=$${JITO_BLOCK_ENGINE}
 JITO_BUNDLE_URL=$${JITO_BLOCK_ENGINE}/api/v1/bundles
@@ -80,6 +81,19 @@ ZMQ_SIGNAL_PORT=5555
 ZMQ_RESULT_PORT=5556
 DEFAULT_PRIORITY_FEE=10000
 RUST_LOG=bigal_executor=info
+
+# Sell speed tuning
+BIGAL_RPC_TIMEOUT_SEC=8
+BIGAL_RPC_CONNECT_TIMEOUT_SEC=4
+BIGAL_LAND_TIMEOUT_SEC=8
+BIGAL_SELL_BALANCE_RETRIES=8
+BIGAL_SELL_BALANCE_POLL_MS=80
+BIGAL_SELL_RETRY_STAGGER_MS=0
+BIGAL_SELL_BUILD_RETRY_MS=50
+BIGAL_BLOCKHASH_MAX_AGE_SEC=40
+BIGAL_BLOCKHASH_POLL_MS=1500
+ZMQ_POLL_TIMEOUT_MS=10
+POSITION_CHECK_INTERVAL=0.5
 EOF
 
 chmod 600 /opt/bigal/.env
@@ -103,10 +117,10 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install websockets aiohttp pyzmq solders solana base58 scikit-learn
 
-echo "=== Building Rust executor ==="
+echo "=== Building Rust executor (with LaserStream) ==="
 source "$HOME/.cargo/env" 2>/dev/null || true
 cd rust/bigal-executor
-cargo build --release
+cargo build --release --features laserstream
 cd /opt/bigal
 
 echo "=== Installing sidecar dependencies ==="
