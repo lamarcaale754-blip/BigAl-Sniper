@@ -2989,13 +2989,48 @@ async def emergency_close_all():
     proc_mgr.stop_all()
 
 async def get_live_balance():
-    """Fetch actual SOL balance from chain via executor."""
-    if executor is None:
-        return None
-    try:
-        return await executor.get_balance()
-    except Exception:
-        return None
+    """Fetch actual SOL balance from chain via executor or direct RPC."""
+    # Try executor first (works if LegacyExecutor fallback is wired)
+    if executor is not None:
+        try:
+            bal = await executor.get_balance()
+            if bal is not None:
+                return bal
+        except Exception:
+            pass
+    # Direct RPC fallback — works in Rust mode where executor has no balance method
+    if aio_session and HELIUS_RPC_URL and "YOUR_API_KEY_HERE" not in HELIUS_RPC_URL:
+        try:
+            # Determine wallet pubkey: prefer LIVE_KEYPAIR, else BIGAL_PRIVATE_KEY-derived
+            pubkey = None
+            if LIVE_KEYPAIR is not None:
+                pubkey = str(LIVE_KEYPAIR.pubkey())
+            elif os.environ.get("BIGAL_PRIVATE_KEY"):
+                # Rust executor wallet — derive pubkey from env
+                from solders.keypair import Keypair as SoldersKeypair
+                pk = os.environ["BIGAL_PRIVATE_KEY"].strip()
+                if pk.startswith("["):
+                    kp = SoldersKeypair.from_bytes(bytes(json.loads(pk)))
+                else:
+                    kp = SoldersKeypair.from_bytes(b58decode(pk))
+                pubkey = str(kp.pubkey())
+            if not pubkey:
+                return None
+            payload = {
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getBalance",
+                "params": [pubkey, {"commitment": "processed"}]
+            }
+            async with aio_session.post(HELIUS_RPC_URL, json=payload,
+                                         timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    lamports = data.get("result", {}).get("value")
+                    if lamports is not None:
+                        return int(lamports) / 1e9
+        except Exception:
+            pass
+    return None
 
 def load_wallet_from_input(wallet_input):
     """Load keypair from base58 private key or JSON array."""
