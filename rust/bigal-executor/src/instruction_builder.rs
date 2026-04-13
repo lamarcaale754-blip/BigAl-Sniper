@@ -45,7 +45,7 @@ use crate::rpc::RpcClient;
 /// Build an SPL Token CloseAccount instruction (index 9).
 /// Reclaims ~0.002 SOL rent from an empty token account.
 fn close_account_ix(account: &Pubkey, destination: &Pubkey, owner: &Pubkey) -> Instruction {
-    let token_program = Pubkey::from_str(config::TOKEN_PROGRAM_ID).unwrap();
+    let token_program = Pubkey::from_str(config::TOKEN_2022_PROGRAM_ID).unwrap();
     Instruction::new_with_bytes(
         token_program,
         &[9u8], // CloseAccount instruction index
@@ -220,9 +220,9 @@ impl InstructionBuilder {
         pda
     }
 
-    /// Get the associated token account address
+    /// Get the associated token account address (uses Token-2022 for Pump.fun mints)
     fn get_ata(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
-        let token_program = Pubkey::from_str(config::TOKEN_PROGRAM_ID).unwrap();
+        let token_program = Pubkey::from_str(config::TOKEN_2022_PROGRAM_ID).unwrap();
         spl_associated_token_account::get_associated_token_address_with_program_id(
             wallet,
             mint,
@@ -310,7 +310,7 @@ impl InstructionBuilder {
         };
         let ix_bytes = borsh::to_vec(&ix_data)?;
 
-        let token_program = Pubkey::from_str(config::TOKEN_PROGRAM_ID)?;
+        let token_program = Pubkey::from_str(config::TOKEN_2022_PROGRAM_ID)?;
         let fee_program = Pubkey::from_str(FEE_PROGRAM_ID)?;
         let creator_vault = self.derive_creator_vault(&curve_state.creator);
         let global_vol_acc = self.derive_global_volume_accumulator();
@@ -483,7 +483,7 @@ impl InstructionBuilder {
         };
         let ix_bytes = borsh::to_vec(&ix_data)?;
 
-        let token_program = Pubkey::from_str(config::TOKEN_PROGRAM_ID)?;
+        let token_program = Pubkey::from_str(config::TOKEN_2022_PROGRAM_ID)?;
         let fee_program = Pubkey::from_str(FEE_PROGRAM_ID)?;
         let creator_vault = self.derive_creator_vault(&curve_state.creator);
         let fee_config = Self::derive_fee_config();
@@ -556,7 +556,7 @@ impl InstructionBuilder {
         let (mint_authority, _) =
             Pubkey::find_program_address(&[b"mint-authority"], &self.program_id);
 
-        let token_program = Pubkey::from_str(config::TOKEN_PROGRAM_ID).unwrap();
+        let token_program = Pubkey::from_str(config::TOKEN_2022_PROGRAM_ID).unwrap();
         let assoc_token_program = Pubkey::from_str(config::ASSOCIATED_TOKEN_PROGRAM_ID).unwrap();
         let system_program = Pubkey::from_str(config::SYSTEM_PROGRAM_ID).unwrap();
         let rent_sysvar = Pubkey::from_str(config::RENT_SYSVAR_ID).unwrap();
