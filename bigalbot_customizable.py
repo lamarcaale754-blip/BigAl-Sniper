@@ -1667,8 +1667,8 @@ _last_broadcast_stats_time: float = 0.0
 async def broadcast_stats():
     global _last_broadcast_stats_time
     now = time.time()
-    if now - _last_broadcast_stats_time < 1.0:
-        return  # rate limit: max 1 broadcast per second
+    if now - _last_broadcast_stats_time < 0.3:
+        return  # rate limit: max ~3 broadcasts per second
     _last_broadcast_stats_time = now
     wr = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
     all_pos = {**positions, **moonbags}
@@ -2752,7 +2752,7 @@ async def dashboard_ticker():
     global paper_balance
     balance_check_counter = 0
     while True:
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
         if dashboard_clients:
             balance_check_counter += 1
             if MODE_LIVE and balance_check_counter >= 10:
