@@ -6,7 +6,6 @@ description = "Low-latency Solana trade executor for BigAl Sniper — Pump.fun i
 
 [features]
 default = []
-# gRPC feature disabled until yellowstone-grpc-proto is compatible with solana-sdk 4.x
 # grpc = ["yellowstone-grpc-client", "yellowstone-grpc-proto", "tonic", "prost", "futures"]
 
 [dependencies]
@@ -31,10 +30,12 @@ zeromq = "0.4"
 # HTTP client (for RPC, Jito API, fee estimation)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
-# gRPC (Yellowstone Geyser) — temporarily removed due to solana-sdk 4.x incompatibility
-# Re-add when yellowstone-grpc-proto releases a solana-sdk 4.x compatible version:
-# yellowstone-grpc-client = { version = "3", optional = true }
-# yellowstone-grpc-proto = { version = "3", optional = true }
+# gRPC (Yellowstone Geyser) — for balance streaming + pre-confirmation tx observation
+# Build with: cargo build --release --features grpc
+# BLOCKED: yellowstone-grpc-proto v3 still depends on solana-sdk 2.x.
+# Uncomment when a solana-sdk 4.x compatible release ships:
+# yellowstone-grpc-client = { version = "4", optional = true }
+# yellowstone-grpc-proto = { version = "4", optional = true }
 # tonic = { version = "0.12", optional = true }
 # prost = { version = "0.13", optional = true }
 # futures = { version = "0.3", optional = true }

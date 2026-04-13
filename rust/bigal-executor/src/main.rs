@@ -389,74 +389,41 @@ async fn handle_buy(
     };
     let tip = if signal.priority == "urgent" { base_tip * 2 } else { base_tip };
 
-    match bundler
-        .submit_bundle(vec![tx.clone()], tip, keypair, blockhash)
-        .await
-    {
-        Ok(bundle_id) => {
+    // Phase 4: Race Jito + direct RPC simultaneously
+    let jito_fut = bundler.submit_bundle(vec![tx.clone()], tip, keypair, blockhash);
+    let rpc_fut = JitoBundler::send_via_rpc(builder.rpc(), &tx);
+
+    match race_submit(jito_fut, rpc_fut).await {
+        Ok((sig_or_id, method)) => {
             let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
 
             // Cache expected token balance for fast sell
             balance_cache.insert(mint, tokens_out);
 
+            let tip_used = if method == "jito" { tip } else { 0 };
             info!(
-                "BUY confirmed via Jito | mint={} | {:.3} SOL | ~{} tokens cached | fee={} tip={} | bundle={} | total={:.0}ms",
-                signal.mint, signal.amount, tokens_out, priority_fee, tip, bundle_id, total_ms
+                "BUY confirmed via {} | mint={} | {:.3} SOL | ~{} tokens cached | fee={} tip={} | {} | total={:.0}ms",
+                method, signal.mint, signal.amount, tokens_out, priority_fee, tip_used, sig_or_id, total_ms
             );
 
             TradeResult::confirmed(
                 signal.id,
-                bundle_id,
-                "jito".to_string(),
+                sig_or_id,
+                method.to_string(),
                 LatencyInfo {
                     zmq_recv_ms,
                     build_ms,
                     land_ms,
                     total_ms,
                     fee_used_lamports: priority_fee,
-                    tip_used_lamports: tip,
+                    tip_used_lamports: tip_used,
                 },
             )
         }
-        Err(jito_err) => {
-            warn!("Jito failed ({}), trying direct RPC...", jito_err);
-
-            match JitoBundler::send_via_rpc(builder.rpc(), &tx).await {
-                Ok(sig) => {
-                    let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
-                    let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
-
-                    // Cache expected token balance for fast sell
-                    balance_cache.insert(mint, tokens_out);
-
-                    info!(
-                        "BUY confirmed via RPC | mint={} | {:.3} SOL | ~{} tokens cached | sig={} | total={:.0}ms",
-                        signal.mint, signal.amount, tokens_out, sig, total_ms
-                    );
-
-                    TradeResult::confirmed(
-                        signal.id,
-                        sig.to_string(),
-                        "rpc".to_string(),
-                        LatencyInfo {
-                            zmq_recv_ms,
-                            build_ms,
-                            land_ms,
-                            total_ms,
-                            fee_used_lamports: priority_fee,
-                            tip_used_lamports: 0,
-                        },
-                    )
-                }
-                Err(rpc_err) => {
-                    error!("BUY FAILED | jito: {} | rpc: {}", jito_err, rpc_err);
-                    TradeResult::failed(
-                        signal.id,
-                        format!("jito: {} | rpc: {}", jito_err, rpc_err),
-                    )
-                }
-            }
+        Err(e) => {
+            error!("BUY FAILED | {}", e);
+            TradeResult::failed(signal.id, format!("{}", e))
         }
     }
 }
@@ -538,77 +505,44 @@ async fn handle_sell(
         let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
         let land_start = Instant::now();
 
-        match bundler
-            .submit_bundle(vec![tx.clone()], tip, keypair, tip_blockhash)
-            .await
-        {
-            Ok(bundle_id) => {
+        // Phase 4: Race Jito bundle + direct RPC simultaneously.
+        // Same tx signature → Solana deduplicates. First success wins.
+        let jito_fut = bundler.submit_bundle(vec![tx.clone()], tip, keypair, tip_blockhash);
+        let rpc_fut = JitoBundler::send_via_rpc(builder.rpc(), &tx);
+
+        match race_submit(jito_fut, rpc_fut).await {
+            Ok((sig_or_id, method)) => {
                 let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
 
-                // Clear balance cache after confirmed sell
                 balance_cache.remove(&mint);
 
+                let tip_used = if method == "jito" { tip } else { 0 };
                 info!(
-                    "SELL confirmed via Jito | mint={} | {}% | fee={} tip={} | bundle={} | total={:.0}ms | attempt={}",
-                    signal.mint, pct, priority_fee, tip, bundle_id, total_ms, attempt
+                    "SELL confirmed via {} | mint={} | {}% | fee={} tip={} | {} | total={:.0}ms | attempt={}",
+                    method, signal.mint, pct, priority_fee, tip_used, sig_or_id, total_ms, attempt
                 );
 
                 return TradeResult::confirmed(
                     signal.id,
-                    bundle_id,
-                    "jito".to_string(),
+                    sig_or_id,
+                    method.to_string(),
                     LatencyInfo {
                         zmq_recv_ms,
                         build_ms,
                         land_ms,
                         total_ms,
                         fee_used_lamports: priority_fee,
-                        tip_used_lamports: tip,
+                        tip_used_lamports: tip_used,
                     },
                 );
             }
-            Err(jito_err) => {
-                warn!(
-                    "Jito failed ({}) attempt {}, trying direct RPC...",
-                    jito_err, attempt
-                );
-
-                match JitoBundler::send_via_rpc(builder.rpc(), &tx).await {
-                    Ok(sig) => {
-                        let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
-                        let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
-
-                        // Clear balance cache after confirmed sell
-                        balance_cache.remove(&mint);
-
-                        info!(
-                            "SELL confirmed via RPC | mint={} | {}% | sig={} | total={:.0}ms | attempt={}",
-                            signal.mint, pct, sig, total_ms, attempt
-                        );
-
-                        return TradeResult::confirmed(
-                            signal.id,
-                            sig.to_string(),
-                            "rpc".to_string(),
-                            LatencyInfo {
-                                zmq_recv_ms,
-                                build_ms,
-                                land_ms,
-                                total_ms,
-                                fee_used_lamports: priority_fee,
-                                tip_used_lamports: 0,
-                            },
-                        );
-                    }
-                    Err(rpc_err) => {
-                        last_failure = format!("jito: {} | rpc: {}", jito_err, rpc_err);
-                        error!("SELL land failed attempt {} | {}", attempt, last_failure);
-                        if attempt < 2 {
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            continue;
-                        }
-                    }
+            Err(e) => {
+                last_failure = format!("{}", e);
+                error!("SELL land failed attempt {} | {}", attempt, last_failure);
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
                 }
             }
         }
@@ -622,6 +556,46 @@ async fn handle_sell(
             last_failure
         },
     )
+}
+
+/// Race Jito bundle submission against direct RPC submission.
+///
+/// Both paths submit the same signed transaction (same signature), so Solana
+/// validators deduplicate — no risk of double execution. Whichever path
+/// confirms first wins; if the winner fails, we await the loser.
+async fn race_submit(
+    jito_fut: impl std::future::Future<Output = Result<String>>,
+    rpc_fut: impl std::future::Future<Output = Result<String>>,
+) -> Result<(String, &'static str)> {
+    tokio::pin!(jito_fut);
+    tokio::pin!(rpc_fut);
+
+    tokio::select! {
+        jito_result = &mut jito_fut => {
+            match jito_result {
+                Ok(id) => Ok((id, "jito")),
+                Err(jito_err) => {
+                    warn!("Jito lost race ({}), awaiting RPC...", jito_err);
+                    match rpc_fut.await {
+                        Ok(sig) => Ok((sig, "rpc")),
+                        Err(rpc_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
+                    }
+                }
+            }
+        }
+        rpc_result = &mut rpc_fut => {
+            match rpc_result {
+                Ok(sig) => Ok((sig, "rpc")),
+                Err(rpc_err) => {
+                    warn!("RPC lost race ({}), awaiting Jito...", rpc_err);
+                    match jito_fut.await {
+                        Ok(id) => Ok((id, "jito")),
+                        Err(jito_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Handle a create-token signal (deploy new Pump.fun token)

@@ -68,75 +68,75 @@ pub async fn execute_kill(
     let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
     let land_start = Instant::now();
 
-    // Step 2: Submit as atomic Jito bundle (sell + tip; tip uses same recent blockhash as sell)
-    match bundler.submit_bundle(
-        vec![sell_tx],
+    // Step 2: Race Jito bundle + direct RPC simultaneously for maximum kill speed.
+    // Same signed tx → Solana deduplicates. First to land wins.
+    let jito_fut = bundler.submit_bundle(
+        vec![sell_tx.clone()],
         tip_lamports,
         keypair,
         tip_blockhash,
-    ).await {
-        Ok(bundle_id) => {
+    );
+    let rpc_fut = JitoBundler::send_via_rpc(builder.rpc(), &sell_tx);
+    tokio::pin!(jito_fut);
+    tokio::pin!(rpc_fut);
+
+    let submission_result: anyhow::Result<(String, &str)> = tokio::select! {
+        jito_result = &mut jito_fut => {
+            match jito_result {
+                Ok(id) => Ok((id, "jito_kill")),
+                Err(jito_err) => {
+                    warn!("Kill Jito failed ({}), awaiting RPC...", jito_err);
+                    match rpc_fut.await {
+                        Ok(sig) => Ok((sig, "rpc_kill")),
+                        Err(rpc_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
+                    }
+                }
+            }
+        }
+        rpc_result = &mut rpc_fut => {
+            match rpc_result {
+                Ok(sig) => Ok((sig, "rpc_kill")),
+                Err(rpc_err) => {
+                    warn!("Kill RPC failed ({}), awaiting Jito...", rpc_err);
+                    match jito_fut.await {
+                        Ok(id) => Ok((id, "jito_kill")),
+                        Err(jito_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
+                    }
+                }
+            }
+        }
+    };
+
+    match submission_result {
+        Ok((sig_or_id, method)) => {
             let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
 
-            // Clear balance cache after kill
             balance_cache.remove(mint);
 
+            let tip_used = if method == "jito_kill" { tip_lamports } else { 0 };
             info!(
-                "KILL CHAIN SUCCESS | bundle={} | build={:.0}ms land={:.0}ms total={:.0}ms",
-                bundle_id, build_ms, land_ms, total_ms
+                "KILL CHAIN SUCCESS via {} | {} | build={:.0}ms land={:.0}ms total={:.0}ms",
+                method, sig_or_id, build_ms, land_ms, total_ms
             );
 
             TradeResult::confirmed(
                 signal_id,
-                bundle_id,
-                "jito_kill".to_string(),
+                sig_or_id,
+                method.to_string(),
                 LatencyInfo {
                     zmq_recv_ms,
                     build_ms,
                     land_ms,
                     total_ms,
                     fee_used_lamports: 500_000,
-                    tip_used_lamports: tip_lamports,
+                    tip_used_lamports: tip_used,
                 },
             )
         }
         Err(e) => {
-            warn!("Kill chain Jito submit failed, attempting direct RPC: {}", e);
-
-            // Fallback: rebuild and send via direct RPC (no cache — fresh data for safety)
-            match attempt_rpc_kill(builder, keypair, mint).await {
-                Ok(sig) => {
-                    let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
-                    let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
-
-                    // Clear balance cache after kill
-                    balance_cache.remove(mint);
-
-                    warn!("Kill chain landed via RPC fallback: {}", sig);
-
-                    TradeResult::confirmed(
-                        signal_id,
-                        sig,
-                        "rpc_kill_fallback".to_string(),
-                        LatencyInfo {
-                            zmq_recv_ms,
-                            build_ms,
-                            land_ms,
-                            total_ms,
-                            fee_used_lamports: 1_000_000,
-                            tip_used_lamports: 0,
-                        },
-                    )
-                }
-                Err(rpc_err) => {
-                    error!("Kill chain FAILED (both Jito and RPC): {} / {}", e, rpc_err);
-                    TradeResult::failed(
-                        signal_id,
-                        format!("jito: {} | rpc: {}", e, rpc_err),
-                    )
-                }
-            }
+            error!("Kill chain FAILED (both Jito and RPC): {}", e);
+            TradeResult::failed(signal_id, format!("{}", e))
         }
     }
 }

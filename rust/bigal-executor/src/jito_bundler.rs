@@ -31,6 +31,9 @@ const FALLBACK_TIP_ACCOUNTS: &[&str] = &[
 /// avoiding complex protobuf dependencies.
 pub struct JitoBundler {
     bundle_url: String,
+    /// Optional secondary Jito endpoint for geographic redundancy.
+    /// When set, `submit_bundle` races both endpoints simultaneously.
+    secondary_bundle_url: Option<String>,
     tip_accounts: Vec<Pubkey>,
     http: reqwest::Client,
 }
@@ -44,16 +47,32 @@ impl JitoBundler {
             format!("{}/api/v1/bundles", block_engine_url.trim_end_matches('/'))
         };
 
+        // Check for secondary Jito endpoint (multi-region redundancy)
+        let secondary_bundle_url = std::env::var("JITO_BLOCK_ENGINE_SECONDARY")
+            .ok()
+            .map(|url| {
+                if url.ends_with("/api/v1/bundles") {
+                    url
+                } else {
+                    format!("{}/api/v1/bundles", url.trim_end_matches('/'))
+                }
+            });
+
         // Initialize with fallback tip accounts
         let tip_accounts: Vec<Pubkey> = FALLBACK_TIP_ACCOUNTS
             .iter()
             .filter_map(|s| Pubkey::from_str(s).ok())
             .collect();
 
-        info!("JitoBundler initialized | url={} | tip_accounts={}", bundle_url, tip_accounts.len());
+        if let Some(ref sec) = secondary_bundle_url {
+            info!("JitoBundler initialized | primary={} | secondary={} | tip_accounts={}", bundle_url, sec, tip_accounts.len());
+        } else {
+            info!("JitoBundler initialized | url={} | tip_accounts={}", bundle_url, tip_accounts.len());
+        }
 
         JitoBundler {
             bundle_url,
+            secondary_bundle_url,
             tip_accounts,
             http: reqwest::Client::new(),
         }
@@ -131,6 +150,8 @@ impl JitoBundler {
     /// Submit a bundle of transactions to Jito block engine.
     ///
     /// The bundle includes all provided transactions plus a tip transaction.
+    /// When a secondary endpoint is configured (JITO_BLOCK_ENGINE_SECONDARY),
+    /// races both endpoints simultaneously — first success wins.
     /// Returns the bundle UUID on success.
     pub async fn submit_bundle(
         &self,
@@ -156,7 +177,7 @@ impl JitoBundler {
 
         debug!("Submitting Jito bundle: {} txs + tip ({} lamports)", transactions.len(), tip_lamports);
 
-        // Submit via JSON-RPC
+        // Build JSON-RPC request (shared by both endpoints)
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -164,16 +185,74 @@ impl JitoBundler {
             "params": [encoded_txs]
         });
 
+        // Multi-region: race primary + secondary if configured
+        if let Some(ref secondary_url) = self.secondary_bundle_url {
+            let primary_fut = self.post_bundle(&self.bundle_url, &request);
+            let secondary_fut = self.post_bundle(secondary_url, &request);
+            tokio::pin!(primary_fut);
+            tokio::pin!(secondary_fut);
+
+            tokio::select! {
+                primary_result = &mut primary_fut => {
+                    match primary_result {
+                        Ok(id) => {
+                            info!("Jito bundle submitted (primary): {}", id);
+                            Ok(id)
+                        }
+                        Err(primary_err) => {
+                            warn!("Jito primary failed ({}), awaiting secondary...", primary_err);
+                            match secondary_fut.await {
+                                Ok(id) => {
+                                    info!("Jito bundle submitted (secondary): {}", id);
+                                    Ok(id)
+                                }
+                                Err(sec_err) => {
+                                    Err(anyhow::anyhow!("primary: {} | secondary: {}", primary_err, sec_err))
+                                }
+                            }
+                        }
+                    }
+                }
+                secondary_result = &mut secondary_fut => {
+                    match secondary_result {
+                        Ok(id) => {
+                            info!("Jito bundle submitted (secondary won): {}", id);
+                            Ok(id)
+                        }
+                        Err(sec_err) => {
+                            warn!("Jito secondary failed ({}), awaiting primary...", sec_err);
+                            match primary_fut.await {
+                                Ok(id) => {
+                                    info!("Jito bundle submitted (primary): {}", id);
+                                    Ok(id)
+                                }
+                                Err(primary_err) => {
+                                    Err(anyhow::anyhow!("primary: {} | secondary: {}", primary_err, sec_err))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Single endpoint
+            let bundle_id = self.post_bundle(&self.bundle_url, &request).await?;
+            info!("Jito bundle submitted: {}", bundle_id);
+            Ok(bundle_id)
+        }
+    }
+
+    /// Post a bundle to a single Jito endpoint and return the bundle UUID.
+    async fn post_bundle(&self, url: &str, request: &serde_json::Value) -> Result<String> {
         let resp = self.http
-            .post(&self.bundle_url)
-            .json(&request)
+            .post(url)
+            .json(request)
             .send()
             .await
             .context("Jito bundle submission failed")?
             .json::<serde_json::Value>()
             .await?;
 
-        // Check for errors
         if let Some(err) = resp.get("error") {
             let err_msg = err.get("message")
                 .and_then(|m| m.as_str())
@@ -181,13 +260,11 @@ impl JitoBundler {
             anyhow::bail!("Jito bundle rejected: {}", err_msg);
         }
 
-        // Extract bundle UUID
         let bundle_id = resp["result"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("No bundle ID in Jito response"))?
             .to_string();
 
-        info!("Jito bundle submitted: {}", bundle_id);
         Ok(bundle_id)
     }
 
