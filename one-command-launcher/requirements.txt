@@ -1,0 +1,8 @@
+# Installed into the parent project's venv by the launcher scripts
+websockets>=12.0
+aiohttp>=3.9.0
+pyzmq>=25.0
+solana>=0.30.0
+solders>=0.18.0
+base58>=2.1.0
+python-dotenv>=1.0.0

@@ -1,0 +1,32 @@
+BigAl Sniper & Rug Puller — repository layout
+==============================================
+
+ROOT (single project home; all paths are relative to this folder)
+  bigalbot_customizable.py   Main bot + dashboard HTTP server
+  bigal_dashboard_customizable.html
+  executor.py                Paper / Legacy / ZmqExecutor backends
+  zmq_bridge.py              Python ↔ Rust ZeroMQ
+  strategy_mode.py, wallet_*.py, rug_*.py, puppet_master.py, honeypot_*.py, pattern_*.py
+  *.json                     Presets / blacklist (no secrets)
+  AGENTS.md, CLAUDE.md       Agent docs
+
+rust/bigal-executor/         Rust trade executor (Cargo project)
+  src/                       Source only — commit this
+  target/                    BUILD OUTPUT — do not upload (in .gitignore); rebuild on each machine
+
+sidecar/                     Optional Helius gRPC Node helper
+  sidecar_grpc.js, package.json
+  node_modules/              Do not upload; run: cd sidecar && npm install
+
+one-command-launcher/        Thin wrapper only (does not duplicate the app)
+  run_bot.py                 chdir to parent, run bigalbot_customizable.py
+  RUN_WINDOWS.cmd, RUN_LINUX.sh, requirements.txt, README.txt
+
+deploy/                      Optional AWS Terraform (secrets not in repo)
+  Use terraform.tfvars.example; real tfvars + .terraform/ are ignored
+
+Upload / sync checklist
+-----------------------
+- Do not include: .env, keypair.txt, rust/**/target/, **/node_modules/, deploy/.terraform/, *.tfstate, trade_journal.csv
+- After copying to a server: pip install (see one-command-launcher/requirements.txt), npm install in sidecar/ if using gRPC sidecar, cargo build --release in rust/bigal-executor/
+- Run the bot from the ROOT folder (or use one-command-launcher so cwd is correct)

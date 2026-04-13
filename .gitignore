@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.local
+.env.*.local
+keypair.txt
+*.egg-info/
+*.egg/
+venv/
+.venv/
+env/
+.pytest_cache/
+dist/
+build/
+
+# Rust — never upload target/ (rebuild with: cd rust/bigal-executor && cargo build --release)
+rust/bigal-executor/target/
+
+# Node.js (gRPC sidecar)
+node_modules/
+sidecar/node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE / local tooling (keep repo portable)
+.vscode/
+.idea/
+*.swp
+*.swo
+.cursor/
+
+# Claude Code (local / machine-specific)
+.claude/
+
+# Secrets — never commit
+*.pem
+*.key
+private_key*
+
+# Runtime logs (repo root)
+*.log
+rust_executor.log
+sidecar.log
+
+# Trade / journal data (regenerated at runtime)
+trade_journal.csv
+
+# Terraform — state and secrets (commit .terraform.lock.hcl for reproducible providers)
+deploy/.terraform/
+deploy/*.tfstate
+deploy/*.tfstate.*
+deploy/terraform.tfvars
+deploy/*.auto.tfvars

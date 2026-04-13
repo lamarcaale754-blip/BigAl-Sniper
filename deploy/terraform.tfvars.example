@@ -1,0 +1,15 @@
+# Copy to terraform.tfvars and fill in your values:
+#   cp terraform.tfvars.example terraform.tfvars
+
+aws_region         = "us-east-1"
+instance_type      = "c6i.xlarge"    # 4 vCPU Intel, optimal for CPU pinning
+key_name           = "your-ec2-keypair-name"
+allowed_ssh_cidr   = "YOUR.IP.HERE/32"  # Lock SSH to your IP
+
+# Secrets (will be stored in SSM Parameter Store)
+helius_rpc_url     = "https://beta.helius-rpc.com/?api-key=YOUR_KEY"
+helius_api_key     = "YOUR_HELIUS_API_KEY"
+wallet_private_key = "YOUR_BASE58_PRIVATE_KEY"
+
+# Jito (NY block engine for us-east-1)
+jito_block_engine  = "https://ny.mainnet.block-engine.jito.wtf"

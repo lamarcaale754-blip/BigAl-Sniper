@@ -1,0 +1,2246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BIGAL SNIPER — Customizable Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --bg:#080a0e;--card:#0d0f12;--card2:#111318;
+    --bdr:#1a1e27;--bdr2:#2a3340;
+    --txt:#c8d0dc;--dim:#5a6577;--muted:#3a4250;--bright:#e8ecf2;
+    --green:#00e676;--red:#ff1744;--cyan:#00bfa5;--orange:#ff9100;
+    --gbg:#0a1f0f;--gbdr:#1a3d1a;--rbg:#1a0a0a;--rbdr:#3d1a1a;
+    --accent:#00e676;
+  }
+  body{font-family:'Outfit',sans-serif;background:var(--bg);color:var(--txt);height:100vh;overflow:hidden;display:flex;flex-direction:column}
+  ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:var(--card)}::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:2px}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+  @keyframes slideIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+
+  .hdr{padding:8px 16px;border-bottom:1px solid #141820;display:flex;align-items:center;justify-content:space-between;background:linear-gradient(180deg,#0d0f14,var(--bg));flex-shrink:0}
+  .hdr-left{display:flex;align-items:center;gap:10px}
+  .logo{width:28px;height:28px;border-radius:6px;background:linear-gradient(135deg,var(--green),var(--cyan));display:flex;align-items:center;justify-content:center;font:700 14px 'JetBrains Mono',monospace;color:var(--bg)}
+  .hdr-title{font-size:14px;font-weight:600;color:var(--bright)}
+  .hdr-title span{color:var(--green);font-family:'JetBrains Mono',monospace;font-size:11px}
+  .hdr-sub{font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace}
+  .hdr-right{display:flex;align-items:center;gap:14px;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--dim)}
+  .stats-dd-wrap{position:relative}
+  .stats-dd-btn{background:#0a0c10;border:1px solid var(--bdr);color:var(--bright);border-radius:4px;padding:4px 10px;font-size:10px;font-family:'JetBrains Mono',monospace;cursor:pointer;font-weight:600}
+  .stats-dd-btn:hover{border-color:var(--bdr2);background:#0e1016}
+  .stats-dropdown{position:absolute;top:100%;right:0;margin-top:6px;width:280px;background:var(--card);border:1px solid var(--bdr);border-radius:8px;box-shadow:0 12px 40px rgba(0,0,0,.5);z-index:900;padding:10px 12px}
+  .stats-dropdown.hidden{display:none}
+  .stats-dd-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:10px}
+  .stats-dd-row .mono{font-weight:600;color:var(--cyan)}
+  .stats-dd-chart{height:100px;position:relative}
+  .rug-subtabs{display:flex;gap:0;border-bottom:1px solid #141820;background:#0a0c10}
+  .rug-subtab{flex:1;text-align:center;padding:8px 6px;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent}
+  .rug-subtab:hover{color:var(--dim)}
+  .rug-subtab.active{color:var(--red);border-bottom-color:var(--red);background:var(--card)}
+  .rug-subtab.narrow{flex:0 0 42px;min-width:42px;font-size:15px;line-height:1;padding:8px 4px}
+  .dash-toast{position:fixed;bottom:22px;right:22px;z-index:2000;max-width:320px;padding:10px 16px;border-radius:8px;font-size:11px;font-family:'JetBrains Mono',monospace;font-weight:600;opacity:0;transform:translateY(10px);transition:opacity .28s,transform .28s;pointer-events:none;box-shadow:0 10px 32px rgba(0,0,0,.5)}
+  .dash-toast.visible{opacity:1;transform:translateY(0)}
+  .dash-toast--ok{background:#0a1f0f;border:1px solid var(--gbdr);color:var(--green)}
+  .dash-toast--warn{background:#1f180a;border:1px solid #4a3d12;color:var(--orange)}
+  .dash-toast--err{background:var(--rbg);border:1px solid var(--rbdr);color:var(--red)}
+  .rug-set-row{margin-bottom:18px}
+  .rug-set-label-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-size:10px;text-transform:uppercase;letter-spacing:.45px;color:var(--muted)}
+  .rug-set-val{font-family:'JetBrains Mono',monospace;color:var(--cyan);font-weight:600;font-size:11px;text-transform:none;letter-spacing:0}
+  input[type=range].rug-range{width:100%;height:5px;-webkit-appearance:none;appearance:none;background:var(--bdr);border-radius:3px}
+  input[type=range].rug-range::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:var(--red);cursor:pointer;border:2px solid #12151c;box-shadow:0 0 0 1px rgba(255,23,68,.25)}
+  input[type=range].rug-range::-moz-range-thumb{width:15px;height:15px;border-radius:50%;background:var(--red);cursor:pointer;border:2px solid #12151c}
+  .rug-select{width:100%;background:#0a0c10;color:var(--bright);border:1px solid var(--bdr);border-radius:4px;padding:7px 8px;font-size:11px;font-family:'JetBrains Mono',monospace;outline:none}
+  .rug-select:focus{border-color:var(--orange)}
+  .rug-toggle-line{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:6px}
+  .rug-toggle-line .rug-toggle-desc{font-size:10px;color:var(--dim);line-height:1.45;flex:1;text-transform:none;letter-spacing:0}
+  .rug-toggle{position:relative;width:46px;height:26px;flex-shrink:0;cursor:pointer}
+  .rug-toggle input{position:absolute;opacity:0;width:0;height:0}
+  .rug-toggle-ui{position:absolute;inset:0;background:#141820;border-radius:13px;border:1px solid var(--bdr);transition:background .2s,border-color .2s}
+  .rug-toggle-ui::after{content:'';position:absolute;width:18px;height:18px;left:4px;top:3px;background:var(--dim);border-radius:50%;transition:left .2s,background .2s}
+  .rug-toggle input:focus-visible + .rug-toggle-ui{outline:2px solid var(--cyan);outline-offset:2px}
+  .rug-toggle input:checked + .rug-toggle-ui{background:rgba(255,23,68,.18);border-color:var(--red)}
+  .rug-toggle input:checked + .rug-toggle-ui::after{left:24px;background:var(--red)}
+  .mode-lbl-btn{cursor:pointer;padding:2px 8px;border:1px solid transparent;border-radius:4px;transition:all .15s;font-weight:600}
+  .mode-lbl-btn:hover{border-color:var(--bdr2);background:rgba(255,255,255,.03)}
+  .pause-btn{display:inline-flex;align-items:center;gap:4px;background:rgba(0,230,118,.08);border:1px solid rgba(0,230,118,.25);color:var(--green);border-radius:4px;padding:3px 8px;font-size:10px;font-family:'JetBrains Mono',monospace;font-weight:600;cursor:pointer;transition:all .15s;letter-spacing:.3px}
+  .pause-btn:hover{background:rgba(0,230,118,.14);border-color:rgba(0,230,118,.4)}
+  .pause-btn.paused{background:rgba(255,145,0,.1);border-color:rgba(255,145,0,.3);color:var(--orange)}
+  .pause-btn.paused:hover{background:rgba(255,145,0,.18);border-color:rgba(255,145,0,.45)}
+  .win-sound-btn{display:inline-flex;align-items:center;gap:4px;background:rgba(0,191,165,.08);border:1px solid rgba(0,191,165,.28);color:var(--cyan);border-radius:4px;padding:3px 8px;font-size:10px;font-family:'JetBrains Mono',monospace;font-weight:600;cursor:pointer;transition:all .15s;letter-spacing:.2px;max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .win-sound-btn:hover{background:rgba(0,191,165,.14);border-color:rgba(0,191,165,.42)}
+  .win-sound-btn.win-sound-off{background:#0a0c10;border-color:var(--bdr);color:var(--muted)}
+  .win-sound-btn.win-sound-off:hover{border-color:var(--bdr2);color:var(--dim)}
+  .cfg-env-banner{font-size:10px;color:var(--dim);line-height:1.5;background:#0a1218;border:1px solid var(--bdr);border-radius:8px;padding:10px 12px;margin-bottom:12px;max-height:200px;overflow-y:auto}
+  .cfg-env-banner strong{color:var(--cyan);font-weight:600}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:4px}
+  .dot.on{background:var(--green);box-shadow:0 0 6px #00e67644;animation:pulse 2s infinite}
+  .dot.off{background:var(--red)}
+
+  .latency-pipeline{display:flex;align-items:center;gap:4px;font-family:'JetBrains Mono',monospace}
+  .lat-chip{display:flex;align-items:center;gap:2px;background:#0a0c10;border:1px solid var(--bdr);border-radius:3px;padding:2px 5px}
+  .lat-label{font-size:8px;color:var(--muted);margin-right:3px}
+  .lat-val{font-size:11px;font-weight:600;color:var(--green)}
+  .lat-unit{font-size:8px;color:var(--muted)}
+  .lat-arrow{color:var(--muted);font-size:9px}
+  .lat-sep{color:var(--bdr2);font-size:11px}
+  .lat-total .lat-val{color:var(--cyan)}
+
+  .stats{display:flex;gap:1px;padding:0;border-bottom:1px solid #141820;flex-shrink:0;background:#141820}
+  .stat{flex:1;background:var(--card);padding:8px 12px}
+  .stat-l{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;font-weight:500;margin-bottom:2px}
+  .stat-v{font-size:16px;font-weight:600;font-family:'JetBrains Mono',monospace;letter-spacing:-.5px}
+  .stat-u{font-size:9px;color:var(--muted);margin-left:3px}
+
+  .main{flex:1;display:flex;overflow:hidden}
+  .left-panels{flex:1;display:flex;flex-direction:column;gap:1px;background:#141820;min-width:0}
+  .left-top{display:flex;gap:1px;flex:1;min-height:0}
+  .left-bottom{display:flex;gap:1px;flex:1;min-height:0}
+
+  .panel{background:var(--card);display:flex;flex-direction:column;overflow:hidden;min-height:0;flex:1}
+  .panel-hdr{padding:6px 12px;border-bottom:1px solid #141820;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;font-weight:500;flex-shrink:0;display:flex;align-items:center;justify-content:space-between}
+
+  .chart-wrap{flex:1;padding:8px 10px 4px 6px;position:relative;min-height:0;max-height:100%;overflow:hidden}
+  .pos-scroll{flex:1;overflow-y:auto;padding:6px 10px}
+  .pos-chip{background:#0a0c10;border:1px solid var(--bdr);border-radius:6px;padding:6px 10px;margin-bottom:4px;display:flex;justify-content:space-between;align-items:center;font-family:'JetBrains Mono',monospace;font-size:11px}
+  .pos-right{display:flex;align-items:center;gap:8px}
+  .sell-btn{background:none;border:1px solid #ff1744;color:#ff1744;border-radius:3px;padding:2px 6px;font-size:9px;font-family:'JetBrains Mono',monospace;cursor:pointer;font-weight:600;letter-spacing:.5px;transition:all .15s}
+  .sell-btn:hover{background:#ff1744;color:#080a0e}
+  .pos-name{color:var(--bright);font-weight:600}
+  .pos-meta{color:var(--dim);font-size:10px}
+  .pos-empty{color:var(--muted);font-size:11px;padding:20px;text-align:center;font-style:italic}
+
+  .trades-scroll{flex:1;overflow-y:auto}
+  table{width:100%;border-collapse:collapse;font-size:11px;font-family:'JetBrains Mono',monospace}
+  thead tr{border-bottom:1px solid #141820;position:sticky;top:0;background:var(--card);z-index:1}
+  th{padding:5px 8px;text-align:left;color:var(--muted);font-size:9px;font-weight:500;text-transform:uppercase;letter-spacing:.4px}
+  td{padding:4px 8px}
+  tbody tr{border-bottom:1px solid #0f1115;animation:slideIn .2s ease-out}
+  tbody tr:hover{background:#0f1218}
+  .badge{font-size:9px;padding:1px 5px;border-radius:3px;display:inline-block}
+  .badge-w{background:var(--gbg);color:var(--green);border:1px solid var(--gbdr)}
+  .badge-l{background:var(--rbg);color:var(--red);border:1px solid var(--rbdr)}
+
+  .term-bar{padding:6px 12px;border-bottom:1px solid #141820;display:flex;align-items:center;gap:6px;flex-shrink:0}
+  .term-dots{display:flex;gap:4px}
+  .term-dot{width:8px;height:8px;border-radius:50%}
+  .term-title{font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace}
+  .term-scroll{flex:1;overflow-y:auto;padding:6px 10px;font-family:'JetBrains Mono',monospace;font-size:10.5px;line-height:1.6;background:#060809}
+  .log-t{color:var(--muted);margin-right:5px}
+  .log-info{color:var(--dim)}.log-entry{color:var(--cyan)}.log-exit-win{color:var(--green)}.log-exit-loss{color:#ff6b6b}.log-warn{color:var(--orange)}
+
+  /* CONTROLS SIDEBAR */
+  .controls-sidebar{width:310px;background:var(--card);border-left:1px solid #141820;display:flex;flex-direction:column;flex-shrink:0;overflow:hidden}
+  .ctrl-header{padding:8px 14px;border-bottom:1px solid #141820;display:flex;align-items:center;justify-content:space-between}
+  .ctrl-header-title{font-size:11px;color:var(--bright);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+  .ctrl-scroll{flex:1;overflow-y:auto;padding:0}
+
+  /* Preset selector */
+  .preset-bar{padding:10px 14px;border-bottom:1px solid #141820;background:var(--card2)}
+  .preset-bar label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;display:block;margin-bottom:4px}
+  .preset-select{width:100%;background:#0a0c10;color:var(--bright);border:1px solid var(--bdr);border-radius:4px;padding:5px 8px;font-size:11px;font-family:'JetBrains Mono',monospace;cursor:pointer;outline:none}
+  .preset-select:focus{border-color:var(--accent)}
+  .preset-select option{background:#0a0c10;color:var(--bright)}
+  .save-row{display:flex;gap:6px;margin-top:6px}
+  .save-input{flex:1;background:#0a0c10;color:var(--bright);border:1px solid var(--bdr);border-radius:4px;padding:4px 8px;font-size:10px;font-family:'JetBrains Mono',monospace;outline:none}
+  .save-input:focus{border-color:var(--accent)}
+  .save-btn,.del-btn{background:none;border:1px solid var(--bdr);color:var(--dim);border-radius:4px;padding:4px 8px;font-size:9px;cursor:pointer;font-family:'JetBrains Mono',monospace}
+  .save-btn:hover{border-color:var(--green);color:var(--green)}
+  .del-btn:hover{border-color:var(--red);color:var(--red)}
+
+  /* Slider groups */
+  .ctrl-group{padding:10px 14px;border-bottom:1px solid #141820}
+  .ctrl-group-title{font-size:9px;color:var(--accent);text-transform:uppercase;letter-spacing:.8px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+  .ctrl-group-title::before{content:'';width:3px;height:10px;background:var(--accent);border-radius:2px}
+  .ctrl-row{margin-bottom:8px}
+  .ctrl-label{display:flex;justify-content:space-between;align-items:center;margin-bottom:3px}
+  .ctrl-name{font-size:10px;color:var(--dim)}
+  .ctrl-val{font-size:11px;color:var(--bright);font-family:'JetBrains Mono',monospace;font-weight:600}
+
+  input[type=range]{-webkit-appearance:none;width:100%;height:4px;background:#1a1e27;border-radius:2px;outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid var(--bg);box-shadow:0 0 4px rgba(0,230,118,.3)}
+  input[type=range]::-webkit-slider-thumb:hover{box-shadow:0 0 8px rgba(0,230,118,.5)}
+  input[type=range]:active::-webkit-slider-thumb{transform:scale(1.2)}
+
+  /* STARTUP MODAL */
+  .modal-overlay{position:fixed;inset:0;background:rgba(4,5,8,.85);backdrop-filter:blur(4px);z-index:1000;display:flex;align-items:center;justify-content:center;transition:all .4s}
+  .modal-overlay.dimmed{background:rgba(4,5,8,.55);backdrop-filter:blur(2px)}
+  .modal-overlay.hidden{opacity:0;pointer-events:none}
+  .modal-box{background:var(--card);border:1px solid var(--bdr);border-radius:12px;padding:36px 40px;width:440px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.6);transition:transform .3s,opacity .3s}
+  .modal-logo{width:48px;height:48px;border-radius:10px;background:linear-gradient(135deg,var(--green),var(--cyan));display:inline-flex;align-items:center;justify-content:center;font:700 22px 'JetBrains Mono',monospace;color:var(--bg);margin-bottom:14px}
+  .modal-title{font-size:18px;font-weight:700;color:var(--bright);margin-bottom:4px}
+  .modal-sub{font-size:11px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-bottom:24px}
+  .mode-btns{display:flex;flex-direction:column;gap:8px;margin-bottom:8px}
+  .mode-btn{background:#0a0c10;border:1px solid var(--bdr);border-radius:8px;padding:12px 16px;cursor:pointer;display:flex;align-items:center;gap:12px;transition:all .15s;text-align:left}
+  .mode-btn:hover{border-color:var(--bdr2);background:#0e1016}
+  .mode-btn.active{border-color:var(--green);background:var(--gbg);box-shadow:0 0 12px rgba(0,230,118,.08)}
+  .mode-btn-icon{width:32px;height:32px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+  .mode-btn-label{font-size:13px;font-weight:600;color:var(--bright)}
+  .mode-btn-desc{font-size:10px;color:var(--dim);margin-top:2px}
+
+  /* Step 2: Config panel */
+  .step{display:none}.step.active{display:block}
+  .cfg-back{background:none;border:none;color:var(--dim);font-size:11px;font-family:'JetBrains Mono',monospace;cursor:pointer;margin-bottom:16px;padding:0;transition:color .15s}
+  .cfg-back:hover{color:var(--bright)}
+  .cfg-mode-tag{display:inline-block;padding:3px 10px;border-radius:4px;font-size:10px;font-family:'JetBrains Mono',monospace;font-weight:600;margin-bottom:18px}
+  .cfg-mode-tag.legacy{background:rgba(255,145,0,.1);border:1px solid rgba(255,145,0,.3);color:var(--orange)}
+  .cfg-mode-tag.rust{background:rgba(0,191,165,.1);border:1px solid rgba(0,191,165,.3);color:var(--cyan)}
+  .cfg-field{text-align:left;margin-bottom:14px}
+  .cfg-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:5px;font-weight:500;display:flex;align-items:center;justify-content:space-between}
+  .cfg-input{width:100%;background:#0a0c10;color:var(--bright);border:1px solid var(--bdr);border-radius:6px;padding:10px 12px;font-size:11px;font-family:'JetBrains Mono',monospace;outline:none;box-sizing:border-box;transition:border-color .2s}
+  .cfg-input:focus{border-color:var(--accent)}
+  .cfg-input::placeholder{color:var(--muted)}
+  .cfg-input.valid{border-color:var(--green)}
+  .cfg-input.invalid{border-color:var(--red)}
+  textarea.cfg-input{resize:none;height:56px}
+  .cfg-hint{font-size:9px;color:var(--dim);margin-top:4px}
+  .cfg-hint a{color:var(--dim);text-decoration:underline}
+
+  /* Validation status */
+  .v-status{display:flex;align-items:center;gap:5px;font-size:10px;font-family:'JetBrains Mono',monospace;min-height:18px;margin-top:5px}
+  .v-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+  .v-dot.pending{background:var(--muted)}
+  .v-dot.checking{background:var(--orange);animation:pulse 1s infinite}
+  .v-dot.ok{background:var(--green)}
+  .v-dot.fail{background:var(--red)}
+  .v-msg{color:var(--dim)}
+  .v-msg.ok{color:var(--green)}.v-msg.fail{color:var(--red)}
+
+  .submit-btn{width:100%;padding:12px;border:none;border-radius:8px;font-size:13px;font-weight:700;font-family:'Outfit',sans-serif;cursor:pointer;letter-spacing:.5px;transition:all .2s;margin-top:6px}
+  .submit-btn{background:linear-gradient(135deg,var(--green),var(--cyan));color:var(--bg)}
+  .submit-btn:hover{box-shadow:0 0 20px rgba(0,191,165,.3)}
+  .submit-btn:disabled{opacity:.4;cursor:not-allowed;box-shadow:none}
+
+  /* ========== RUG PULLER MODE ========== */
+  .rug-stats{display:flex;gap:1px;padding:0;border-bottom:1px solid #141820;flex-shrink:0;background:#141820}
+  .rug-stats .stat{flex:1;background:var(--card);padding:8px 12px}
+
+  .rug-right{width:310px;background:var(--card);border-left:1px solid #141820;display:flex;flex-direction:column;flex-shrink:0;overflow:hidden}
+
+  /* Bot suspect table */
+  .bot-table{width:100%;border-collapse:collapse;font-size:10.5px;font-family:'JetBrains Mono',monospace}
+  .bot-table thead tr{border-bottom:1px solid #141820;position:sticky;top:0;background:var(--card);z-index:1}
+  .bot-table th{padding:5px 8px;text-align:left;color:var(--muted);font-size:9px;font-weight:500;text-transform:uppercase;letter-spacing:.4px}
+  .bot-table td{padding:5px 8px;border-bottom:1px solid #0f1115}
+  .bot-table tbody tr{animation:slideIn .2s ease-out;transition:background .1s}
+  .bot-table tbody tr:hover{background:#0f1218}
+  .bot-table tbody tr.confirmed{border-left:2px solid var(--red)}
+  .bot-table tbody tr.suspected{border-left:2px solid var(--orange)}
+  /* Plan tabs */
+  .plan-tab{position:relative;padding:5px 22px 5px 10px;font-size:10px;font-family:'JetBrains Mono',monospace;border:1px solid var(--bdr);border-bottom:none;border-radius:4px 4px 0 0;cursor:pointer;color:var(--muted);background:transparent;transition:all .15s}
+  .plan-tab-x{position:absolute;right:4px;top:50%;transform:translateY(-50%);width:16px;height:16px;line-height:14px;text-align:center;border:none;background:rgba(255,23,68,.15);color:var(--red);border-radius:3px;font-size:11px;cursor:pointer;padding:0;font-weight:700}
+  .plan-tab-x:hover{background:rgba(255,23,68,.35)}
+  .plan-tab:hover{color:var(--bright);background:#0f1218}
+  .plan-tab.active{color:var(--bright);background:var(--card);border-color:var(--orange)}
+  .plan-tab .tab-status{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}
+  .plan-tab .tab-status.planned{background:var(--orange)}
+  .plan-tab .tab-status.approved{background:var(--green)}
+  .plan-tab .tab-status.deploying{background:var(--cyan);animation:pulse 1s infinite}
+  .plan-tab .tab-status.killed{background:var(--red)}
+  .plan-tab .tab-status.rejected{background:var(--muted)}
+  .plan-detail-row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #0f1115}
+  .plan-detail-row .lbl{color:var(--muted)}
+  .plan-detail-row .val{color:var(--bright)}
+  .plan-btn{padding:6px 16px;border:none;border-radius:4px;font-size:10px;font-family:'JetBrains Mono',monospace;cursor:pointer;font-weight:600;letter-spacing:.3px}
+  .plan-btn.approve{background:rgba(0,230,118,.15);color:var(--green);border:1px solid rgba(0,230,118,.3)}
+  .plan-btn.approve:hover{background:rgba(0,230,118,.25)}
+  .plan-btn.reject{background:rgba(255,23,68,.1);color:var(--red);border:1px solid rgba(255,23,68,.3)}
+  .plan-btn.reject:hover{background:rgba(255,23,68,.2)}
+
+  /* Score bar */
+  .score-bar{width:60px;height:6px;background:#1a1e27;border-radius:3px;overflow:hidden;display:inline-block;vertical-align:middle;margin-left:4px}
+  .score-fill{height:100%;border-radius:3px;transition:width .3s}
+
+  /* Status badges */
+  .st-badge{font-size:8px;padding:1px 5px;border-radius:3px;display:inline-block;font-weight:600;letter-spacing:.3px}
+  .st-watching{background:#1a1e27;color:var(--muted)}
+  .st-scoring{background:rgba(0,191,165,.1);color:var(--cyan);border:1px solid rgba(0,191,165,.2)}
+  .st-suspected{background:rgba(255,145,0,.1);color:var(--orange);border:1px solid rgba(255,145,0,.2)}
+  .st-confirmed{background:var(--rbg);color:var(--red);border:1px solid var(--rbdr)}
+
+  /* Locked placeholder panels */
+  .locked-panel{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--muted);text-align:center}
+  .locked-icon{font-size:28px;opacity:.3}
+  .locked-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px}
+  .locked-desc{font-size:10px;color:var(--dim);max-width:200px;line-height:1.4}
+
+  /* Rug puller header accent */
+  .hdr.rug-mode .hdr-title span{color:var(--red)}
+  .hdr.rug-mode .logo{background:linear-gradient(135deg,var(--red),var(--orange))}
+
+  /* Bot deployment cards (right sidebar placeholders) */
+  .deploy-card{background:#0a0c10;border:1px solid var(--bdr);border-radius:6px;padding:10px 12px;margin:6px 10px;font-family:'JetBrains Mono',monospace}
+  .deploy-card-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+  .deploy-card-title{font-size:11px;font-weight:600;color:var(--bright)}
+  .deploy-card-status{font-size:9px;padding:2px 6px;border-radius:3px;background:#1a1e27;color:var(--muted)}
+
+  /* Component score breakdown */
+  .comp-row{display:flex;align-items:center;gap:6px;margin-bottom:3px}
+  .comp-label{font-size:8px;color:var(--dim);width:52px;text-transform:uppercase}
+  .comp-bar{flex:1;height:4px;background:#1a1e27;border-radius:2px;overflow:hidden}
+  .comp-fill{height:100%;border-radius:2px;transition:width .3s}
+</style>
+</head>
+<body>
+
+<!-- STARTUP MODAL -->
+<div class="modal-overlay" id="startupModal">
+  <div class="modal-box">
+
+    <!-- STEP 1: Mode Selection -->
+    <div class="step active" id="step1">
+      <div class="modal-logo">B</div>
+      <div class="modal-title">BIGAL SNIPER</div>
+      <div class="modal-sub">SELECT TRADING MODE</div>
+      <div class="mode-btns">
+        <div class="mode-btn active" id="modeBtn_paper" onclick="selectMode('paper')">
+          <div class="mode-btn-icon" style="background:var(--gbg);color:var(--green)">P</div>
+          <div><div class="mode-btn-label">Paper Mode</div><div class="mode-btn-desc">Simulated trading, no real transactions</div></div>
+        </div>
+        <div class="mode-btn" id="modeBtn_legacy" onclick="selectMode('legacy')">
+          <div class="mode-btn-icon" style="background:var(--card2);color:var(--orange)">L</div>
+          <div><div class="mode-btn-label">Live (Legacy)</div><div class="mode-btn-desc">PumpPortal HTTP execution</div></div>
+        </div>
+        <div class="mode-btn" id="modeBtn_zmq_rust" onclick="selectMode('zmq_rust')">
+          <div class="mode-btn-icon" style="background:#0a1520;color:var(--cyan)">R</div>
+          <div><div class="mode-btn-label">Live (Rust Executor)</div><div class="mode-btn-desc">Low-latency ZMQ + Jito bundles</div></div>
+        </div>
+        <div style="height:1px;background:var(--bdr);margin:4px 0"></div>
+        <div class="mode-btn" id="modeBtn_rug_puller_test" onclick="selectMode('rug_puller_test')">
+          <div class="mode-btn-icon" style="background:#1a0a12;color:var(--orange)">&#9760;</div>
+          <div><div class="mode-btn-label">Rug Puller (Test)</div><div class="mode-btn-desc">Detect bots with simulated honeypots — no real SOL</div></div>
+        </div>
+        <div class="mode-btn" id="modeBtn_analysis" onclick="selectMode('analysis')">
+          <div class="mode-btn-icon" style="background:#0a1218;color:#b388ff">A</div>
+          <div><div class="mode-btn-label">Analysis (Full Pipeline)</div><div class="mode-btn-desc">Stages 1-5 with simulated execution — profiler, cracker, planner all active</div></div>
+        </div>
+        <div class="mode-btn" id="modeBtn_rug_puller_live" onclick="selectMode('rug_puller_live')">
+          <div class="mode-btn-icon" style="background:#1a0a12;color:var(--red)">&#9760;</div>
+          <div><div class="mode-btn-label">Rug Puller (Live)</div><div class="mode-btn-desc">Full exploitation — real tokens, real rug pulls</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- STEP 2: Configuration + Validation -->
+    <div class="step" id="step2">
+      <button class="cfg-back" onclick="goBackToStep1()">&lt; Back to mode select</button>
+      <div class="modal-title" style="font-size:15px">Configure Connection</div>
+      <div class="cfg-mode-tag" id="cfgModeTag">LEGACY</div>
+      <div id="cfgEnvBanner" class="cfg-env-banner" style="display:none"></div>
+
+      <div class="cfg-field">
+        <div class="cfg-label">Private Key <span style="font-size:8px;color:var(--dim)">(base58 or JSON array)</span></div>
+        <textarea class="cfg-input" id="cfgKey" placeholder="Paste private key here..." spellcheck="false"></textarea>
+        <div class="cfg-hint">Optional if <strong>BIGAL_PRIVATE_KEY</strong> or <strong>keypair.txt</strong> is already on the server</div>
+        <div class="v-status" id="vKey"><span class="v-dot pending"></span><span class="v-msg">Waiting for input</span></div>
+      </div>
+
+      <div class="cfg-field">
+        <div class="cfg-label">Helius RPC API Key</div>
+        <input class="cfg-input" id="cfgRpc" type="text" placeholder="Your Helius API key..." spellcheck="false">
+        <div class="cfg-hint">Optional if <strong>HELIUS_RPC_URL</strong> is already set in the environment</div>
+        <div class="v-status" id="vRpc"><span class="v-dot pending"></span><span class="v-msg">Waiting for input</span></div>
+      </div>
+
+      <div class="cfg-field" id="cfgRustField" style="display:none">
+        <div class="cfg-label">Rust Executor</div>
+        <div class="v-status" id="vRust" style="min-height:24px"><span class="v-dot ok"></span><span class="v-msg">Will auto-start on submit</span></div>
+      </div>
+
+      <div class="cfg-field" id="cfgSidecarField" style="display:none">
+        <div class="cfg-label">gRPC Sidecar <span style="font-size:8px;color:var(--dim)">(Helius LaserStream)</span></div>
+        <div class="v-status" id="vSidecar" style="min-height:24px"><span class="v-dot pending"></span><span class="v-msg">Will auto-start if Helius API key provided above</span></div>
+      </div>
+
+      <div class="cfg-field" id="cfgGrpcField" style="display:none">
+        <div class="cfg-label">Yellowstone gRPC Endpoint <span style="font-size:8px;color:var(--dim)">(Geyser streaming)</span></div>
+        <input class="cfg-input" id="cfgGrpc" type="text" placeholder="https://your-grpc-provider.com" spellcheck="false">
+        <div class="cfg-hint">Optional — enables pre-confirmation transaction streaming for faster detection</div>
+        <div class="v-status" id="vGrpc"><span class="v-dot pending"></span><span class="v-msg">Optional</span></div>
+      </div>
+
+      <div class="cfg-field" id="cfgGrpcTokenField" style="display:none">
+        <div class="cfg-label">gRPC Auth Token</div>
+        <input class="cfg-input" id="cfgGrpcToken" type="text" placeholder="x-token from gRPC provider" spellcheck="false">
+        <div class="cfg-hint">Required if gRPC endpoint is set</div>
+      </div>
+
+      <div class="cfg-field" id="cfgJitoField" style="display:none">
+        <div class="cfg-label">Jito Block Engine</div>
+        <select class="cfg-input" id="cfgJito" style="padding:6px 10px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:11px">
+          <option value="https://ny.mainnet.block-engine.jito.wtf" selected>NY — US East (default)</option>
+          <option value="https://amsterdam.mainnet.block-engine.jito.wtf">Amsterdam</option>
+          <option value="https://tokyo.mainnet.block-engine.jito.wtf">Tokyo</option>
+        </select>
+        <div class="cfg-hint">Closest block engine for lowest latency</div>
+      </div>
+
+      <button class="submit-btn" id="submitBtn" onclick="submitConfig()" disabled>CONNECT</button>
+    </div>
+
+  </div>
+</div>
+
+<!-- MODE SWITCH (Sniper ↔ Rug Puller): stop session first -->
+<div class="modal-overlay hidden" id="modeSwitchModal" style="display:none;z-index:1001">
+  <div class="modal-box" style="width:460px;text-align:left">
+    <div class="modal-title" style="text-align:center">Switch product mode</div>
+    <p style="font-size:11px;color:var(--dim);line-height:1.55;margin:14px 0 18px">
+      Switching between <strong style="color:var(--green)">BigAl Sniper</strong> and <strong style="color:var(--red)">Rug Puller</strong> requires stopping the current session: the hunter orchestrator, Rust executor, and gRPC sidecar are terminated so the next mode can bind IPC and ports cleanly.
+    </p>
+    <button type="button" class="submit-btn" style="background:linear-gradient(135deg,var(--red),var(--orange))" onclick="confirmModeSwitchTerminate()">Stop session &amp; choose mode</button>
+    <button type="button" class="cfg-back" style="display:block;width:100%;text-align:center;margin-top:14px" onclick="closeModeSwitchModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Rug Puller: auto-approve confirmation -->
+<div class="modal-overlay hidden" id="rugAutoApproveModal" style="display:none;z-index:1002">
+  <div class="modal-box" style="width:420px;text-align:left">
+    <div class="modal-title" style="text-align:center;font-size:15px">Enable auto-approve?</div>
+    <p style="font-size:11px;color:var(--dim);line-height:1.55;margin:14px 0 18px">
+      The orchestrator will mark new auto-generated honeypot plans as <strong style="color:var(--red)">approved</strong> immediately, allowing Stage 4 deployment without your manual confirmation. This can spend real SOL in live mode.
+    </p>
+    <button type="button" class="submit-btn" style="background:linear-gradient(135deg,var(--red),var(--orange))" onclick="confirmRugAutoApprove()">I understand — enable</button>
+    <button type="button" class="cfg-back" style="display:block;width:100%;text-align:center;margin-top:14px" onclick="closeRugAutoApproveModal()">Cancel</button>
+  </div>
+</div>
+
+<div id="dashToast" class="dash-toast dash-toast--ok" role="status" aria-live="polite"></div>
+
+<!-- Rug Puller: confirm Plan request (Cancel before send) -->
+<div class="modal-overlay hidden" id="planConfirmModal" style="display:none;z-index:1003">
+  <div class="modal-box" style="width:420px;text-align:left">
+    <div class="modal-title" style="text-align:center;font-size:15px">Generate honeypot plan?</div>
+    <p style="font-size:11px;color:var(--dim);line-height:1.55;margin:12px 0 8px">
+      Builds a plan for this wallet immediately. Dashboard filters (age, auto-trigger threshold, ML confidence) do <strong>not</strong> apply. In <strong>live</strong> mode, if ML cannot produce a confident signature, a <strong>heuristic mock plan</strong> is still created for review.
+    </p>
+    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--cyan);word-break:break-all;background:#0a0c10;border:1px solid var(--bdr);border-radius:6px;padding:10px;margin-bottom:16px" id="planConfirmWalletFull"></div>
+    <button type="button" class="submit-btn" style="background:linear-gradient(135deg,var(--orange),var(--red))" onclick="executePlanConfirm()">Generate plan</button>
+    <button type="button" class="cfg-back" style="display:block;width:100%;text-align:center;margin-top:14px" onclick="closePlanConfirmModal()">Cancel</button>
+  </div>
+</div>
+
+<audio id="rustWinAudio" preload="auto" playsinline>
+  <source src="assets/sounds/rust-win-celebration.mp3" type="audio/mpeg">
+</audio>
+<audio id="rustLossAudio" preload="auto" playsinline>
+  <source src="assets/sounds/rust-loss-hallelujah.mp3" type="audio/mpeg">
+</audio>
+<!-- HEADER -->
+<div class="hdr">
+  <div class="hdr-left">
+    <div class="logo">B</div>
+    <div>
+      <div class="hdr-title">BIGAL SNIPER <span>CUSTOM</span></div>
+      <div class="hdr-sub">PUMPFUN · REAL-TIME TUNING</div>
+    </div>
+  </div>
+  <div class="hdr-right">
+    <div class="stats-dd-wrap">
+      <button type="button" class="stats-dd-btn" id="statsDdBtn" onclick="toggleStatsDropdown(event)">Stats ▾</button>
+      <div id="statsDropdown" class="stats-dropdown hidden">
+        <div class="stats-dd-row"><span style="color:var(--muted)">Balance (model)</span><span id="ddBalance" class="mono">-- SOL</span></div>
+        <div class="stats-dd-row"><span style="color:var(--muted)">Cumulative PnL (model)</span><span id="ddPnl" class="mono">--</span></div>
+        <div class="stats-dd-row"><span style="color:var(--muted)">Wallet Δ (chain)</span><span id="ddWalletDelta" class="mono" title="On-chain SOL change vs session start; includes fees">--</span></div>
+        <div class="stats-dd-chart"><canvas id="statsMiniChart"></canvas></div>
+      </div>
+    </div>
+    <div class="latency-pipeline" id="latencyPipeline" style="display:none">
+      <span class="lat-chip"><span class="lat-label">ZMQ</span><span class="lat-val" id="latZmq">--</span><span class="lat-unit">ms</span></span>
+      <span class="lat-arrow">&gt;</span>
+      <span class="lat-chip"><span class="lat-label">BUILD</span><span class="lat-val" id="latBuild">--</span><span class="lat-unit">ms</span></span>
+      <span class="lat-arrow">&gt;</span>
+      <span class="lat-chip"><span class="lat-label">LAND</span><span class="lat-val" id="latLand">--</span><span class="lat-unit">ms</span></span>
+      <span class="lat-sep">|</span>
+      <span class="lat-chip lat-total"><span class="lat-label">TOTAL</span><span class="lat-val" id="latTotal">--</span><span class="lat-unit">ms</span></span>
+    </div>
+    <div><span class="dot off" id="dot"></span><span id="statusLbl">CONNECTING</span></div>
+    <button type="button" class="win-sound-btn" id="winSoundBtn" onclick="toggleWinSound()" title="Rust mode: celebration audio ~30s on trades with PnL over 10% (one burst; interrupts loss clip)">Win sound: on</button>
+    <button type="button" class="win-sound-btn" id="lossSoundBtn" onclick="toggleLossSound()" title="Rust mode: loss audio ~20s on negative-PnL exits (one burst; interrupts win clip)">Loss sound: on</button>
+    <button type="button" class="pause-btn" id="pauseBtn" onclick="togglePause()" title="Pause/Resume new entries"><span id="pauseIcon">▶</span> <span id="pauseLbl">ACTIVE</span></button>
+    <span id="modeLbl" class="mode-lbl-btn" onclick="openModeSwitch()" title="Click to change mode">--</span>
+  </div>
+</div>
+
+<!-- STATS BAR (Sniper) -->
+<div class="stats" id="sniperStats">
+  <div class="stat"><div class="stat-l">Balance</div><div class="stat-v" id="sBalance" style="color:var(--bright)">--<span class="stat-u">SOL</span></div></div>
+  <div class="stat"><div class="stat-l">PnL</div><div class="stat-v" id="sPnl">--<span class="stat-u">SOL</span></div></div>
+  <div class="stat" id="walletDeltaStat" style="display:none" title="On-chain SOL change since live session started (fees, tips, slippage included)"><div class="stat-l">Wallet Δ</div><div class="stat-v" id="sWalletDelta">--<span class="stat-u">SOL</span></div></div>
+  <div class="stat"><div class="stat-l">Win Rate</div><div class="stat-v" id="sWR">--<span class="stat-u">%</span></div></div>
+  <div class="stat"><div class="stat-l">W / L</div><div class="stat-v" id="sWL" style="color:var(--bright)">--</div></div>
+  <div class="stat"><div class="stat-l">Positions</div><div class="stat-v" id="sPos" style="color:var(--bright)">0</div></div>
+  <div class="stat"><div class="stat-l">Moonbags</div><div class="stat-v" id="sMB" style="color:var(--cyan)">0</div></div>
+  <div class="stat"><div class="stat-l">Cooldown</div><div class="stat-v" id="sCD" style="color:var(--dim)">--</div></div>
+</div>
+
+<!-- STATS BAR (Rug Puller) -->
+<div class="rug-stats" id="rugStats" style="display:none">
+  <div class="stat"><div class="stat-l">Wallets</div><div class="stat-v" id="rpWallets" style="color:var(--bright)">0</div></div>
+  <div class="stat"><div class="stat-l">Scored</div><div class="stat-v" id="rpScored" style="color:var(--cyan)">0</div></div>
+  <div class="stat"><div class="stat-l">Suspected</div><div class="stat-v" id="rpSuspected" style="color:var(--orange)">0</div></div>
+  <div class="stat"><div class="stat-l">Confirmed</div><div class="stat-v" id="rpConfirmed" style="color:var(--red)">0</div></div>
+  <div class="stat"><div class="stat-l">Events</div><div class="stat-v" id="rpEvents" style="color:var(--bright)">0</div></div>
+  <div class="stat"><div class="stat-l">Events/s</div><div class="stat-v" id="rpEps" style="color:var(--green)">0</div></div>
+  <div class="stat"><div class="stat-l">Tokens</div><div class="stat-v" id="rpTokens" style="color:var(--dim)">0</div></div>
+</div>
+
+<!-- MAIN LAYOUT: Left panels + Controls sidebar -->
+<div class="main" id="sniperMain">
+  <div class="left-panels">
+    <div class="left-top">
+      <!-- CHART -->
+      <div class="panel">
+        <div class="panel-hdr">Cumulative PnL</div>
+        <div class="chart-wrap"><div style="position:relative;width:100%;height:100%"><canvas id="chart" style="position:absolute;inset:0"></canvas></div></div>
+      </div>
+      <!-- POSITIONS -->
+      <div class="panel">
+        <div class="panel-hdr">Open Positions <span id="posCount" style="color:var(--green)">0</span></div>
+        <div class="pos-scroll" id="posGrid"><div class="pos-empty">No open positions</div></div>
+      </div>
+    </div>
+    <div class="left-bottom">
+      <!-- TRADES -->
+      <div class="panel">
+        <div class="panel-hdr">Recent Trades <span id="tradeCount" style="color:var(--dim)">0</span></div>
+        <div class="trades-scroll">
+          <table><thead><tr><th>Time</th><th>Token</th><th>PnL</th><th>SOL</th><th>Hold</th><th>Exit</th></tr></thead>
+          <tbody id="tBody"></tbody></table>
+        </div>
+      </div>
+      <!-- TERMINAL -->
+      <div class="panel" style="display:flex;flex-direction:column">
+        <div class="term-bar">
+          <div class="term-dots"><div class="term-dot" style="background:#ff5f57"></div><div class="term-dot" style="background:#ffbd2e"></div><div class="term-dot" style="background:#28c840"></div></div>
+          <span class="term-title">terminal</span>
+        </div>
+        <div class="term-scroll" id="term"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CONTROLS SIDEBAR -->
+  <div class="controls-sidebar">
+    <div class="ctrl-header">
+      <span class="ctrl-header-title">Controls</span>
+      <span style="font-size:9px;color:var(--dim);font-family:'JetBrains Mono',monospace">LIVE TUNING</span>
+    </div>
+
+    <!-- PRESET SELECTOR -->
+    <div class="preset-bar">
+      <label>Preset</label>
+      <select class="preset-select" id="presetSelect" onchange="applyPreset(this.value)">
+        <option value="">-- Select Preset --</option>
+        <option value="aggressive">Aggressive</option>
+        <option value="balanced">Balanced (Default)</option>
+        <option value="conservative">Conservative</option>
+        <option value="scalper">Scalper</option>
+        <option value="momentum">Momentum</option>
+        <option value="data_optimized">Data Optimized</option>
+      </select>
+      <div class="save-row">
+        <input class="save-input" id="presetName" placeholder="Custom preset name...">
+        <button class="save-btn" onclick="savePreset()">SAVE</button>
+        <button class="del-btn" onclick="deletePreset()">DEL</button>
+      </div>
+    </div>
+
+    <div class="ctrl-scroll" id="ctrlScroll">
+      <!-- EXIT STRATEGY -->
+      <div class="ctrl-group">
+        <div class="ctrl-group-title">Exit Strategy</div>
+        <div class="ctrl-row" id="sl_row"></div>
+        <div class="ctrl-row" id="tp1_row"></div>
+        <div class="ctrl-row" id="tp2_row"></div>
+        <div class="ctrl-row" id="max_hold_row"></div>
+      </div>
+
+      <!-- TRAILING STOP -->
+      <div class="ctrl-group">
+        <div class="ctrl-group-title">Trailing Stop</div>
+        <div class="ctrl-row" id="trail_min_row"></div>
+        <div class="ctrl-row" id="trail_peak_row"></div>
+      </div>
+
+      <!-- ENTRY FILTERS -->
+      <div class="ctrl-group">
+        <div class="ctrl-group-title">Entry Filters</div>
+        <div class="ctrl-row" id="entry_buyers_row"></div>
+        <div class="ctrl-row" id="entry_vol_row"></div>
+        <div class="ctrl-row" id="sell_ratio_row"></div>
+        <div class="ctrl-row" id="net_buy_row"></div>
+        <div class="ctrl-row" id="max_pump_row"></div>
+        <div class="ctrl-row" id="min_age_row"></div>
+        <div class="ctrl-row" id="min_pool_row"></div>
+      </div>
+
+      <!-- BONDING CURVE -->
+      <div class="ctrl-group">
+        <div class="ctrl-group-title">Bonding Curve</div>
+        <div class="ctrl-row" id="bc_min_row"></div>
+        <div class="ctrl-row" id="bc_max_row"></div>
+      </div>
+
+      <!-- MOONBAG -->
+      <div class="ctrl-group">
+        <div class="ctrl-group-title">Moonbag</div>
+        <div class="ctrl-row" id="moonbag_pct_row"></div>
+        <div class="ctrl-row" id="moonbag_expire_row"></div>
+        <div class="ctrl-row" id="moonbag_sl_row"></div>
+        <div class="ctrl-row" id="moonbag_trail_row"></div>
+        <div class="ctrl-row" id="candidate_age_row"></div>
+      </div>
+
+      <!-- VELOCITY CHECK -->
+      <div class="ctrl-group">
+        <div class="ctrl-group-title">Velocity Check</div>
+        <div class="ctrl-row" id="velocity_check_row"></div>
+        <div class="ctrl-row" id="velocity_drop_row"></div>
+      </div>
+
+      <!-- ANTI-MANIPULATION -->
+      <div class="ctrl-group">
+        <div class="ctrl-group-title">Anti-Manipulation</div>
+        <div class="ctrl-row" id="anti_manip_row"></div>
+        <div class="ctrl-row" id="min_wallet_diversity_row"></div>
+        <div class="ctrl-row" id="max_repeat_wallets_row"></div>
+        <div class="ctrl-row" id="random_skip_pct_row"></div>
+      </div>
+
+      <!-- STRATEGY MODE -->
+      <div class="ctrl-group" id="strategyModeGroup">
+        <div class="ctrl-group-title" style="color:#b388ff">Strategy Mode</div>
+        <div class="ctrl-row" style="display:flex;align-items:center;justify-content:space-between;padding:4px 0">
+          <span style="font-size:10px;color:var(--bright)">Parameter Source</span>
+          <select id="strategyModeSelect" onchange="onStrategyModeChange(this.value)" style="background:var(--card2);color:var(--bright);border:1px solid var(--bdr);border-radius:4px;padding:3px 8px;font-size:10px;font-family:inherit;cursor:pointer;outline:none">
+            <option value="manual">Manual</option>
+            <option value="adaptive">Adaptive</option>
+            <option value="hybrid">Hybrid</option>
+          </select>
+        </div>
+        <div id="strategyManualValues">
+          <div class="ctrl-row" id="manual_tip_row"></div>
+          <div class="ctrl-row" id="manual_min_liquidity_row"></div>
+          <div class="ctrl-row" id="manual_entry_progress_row"></div>
+        </div>
+        <div id="strategyOverrides" style="display:none">
+          <div style="font-size:8px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;padding:6px 0 2px">Hybrid Overrides (use manual value instead of adaptive)</div>
+          <div class="ctrl-row" id="override_tip_row"></div>
+          <div class="ctrl-row" id="override_liquidity_row"></div>
+          <div class="ctrl-row" id="override_entry_row"></div>
+        </div>
+      </div>
+
+      <!-- RISK / COOLDOWN -->
+      <div class="ctrl-group">
+        <div class="ctrl-group-title">Risk / Cooldown</div>
+        <div class="ctrl-row" id="max_positions_row"></div>
+        <div class="ctrl-row" id="trade_size_row"></div>
+        <div class="ctrl-row" id="cooldown_losses_row"></div>
+        <div class="ctrl-row" id="cooldown_sec_row"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- RUG PULLER LAYOUT (hidden by default, shown when rug_puller mode active) -->
+<div class="main" id="rugMain" style="display:none">
+  <div class="left-panels">
+    <div class="left-top">
+      <!-- PLAN APPROVAL (Stage 3) -->
+      <div class="panel">
+        <div class="panel-hdr" style="color:var(--red)">Plan Approval <span id="planCount" style="color:var(--orange);font-size:10px;margin-left:6px">0</span></div>
+        <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+          <!-- Plan tabs -->
+          <div id="planTabs" style="display:flex;gap:2px;padding:4px 8px 0;overflow-x:auto;flex-shrink:0;border-bottom:1px solid var(--bdr)">
+            <div id="planTabEmpty" style="color:var(--muted);font-size:10px;padding:6px 10px;font-style:italic">No plans yet — waiting for confirmed bots...</div>
+          </div>
+          <!-- Plan detail -->
+          <div id="planDetail" style="flex:1;overflow-y:auto;padding:10px;font-size:10.5px;font-family:'JetBrains Mono',monospace">
+          </div>
+        </div>
+      </div>
+      <!-- PROFILER OVERVIEW -->
+      <div class="panel">
+        <div class="panel-hdr">Profiler Overview</div>
+        <div style="padding:10px;flex:1;display:flex;flex-direction:column;gap:6px;overflow-y:auto" id="profilerOverview">
+          <div style="color:var(--muted);font-size:11px;text-align:center;padding:20px;font-style:italic">Collecting wallet data...</div>
+        </div>
+      </div>
+    </div>
+    <div class="left-bottom">
+      <!-- ML ENGINE — Suspected Bot Table -->
+      <div class="panel">
+        <div class="panel-hdr">ML Engine — Suspected Bots <span id="botCount" style="color:var(--red)">0</span></div>
+        <div class="trades-scroll" style="flex:1;overflow-y:auto">
+          <table class="bot-table">
+            <thead>
+              <tr>
+                <th>Wallet</th>
+                <th>Buys</th>
+                <th>Tokens</th>
+                <th>Avg SOL</th>
+                <th>Avg Time</th>
+                <th>Score</th>
+                <th>Status</th>
+                <th>Plan</th>
+              </tr>
+            </thead>
+            <tbody id="botTableBody">
+              <tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px;font-style:italic">Waiting for trade data — profiler needs 8+ buys per wallet to score...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <!-- TERMINAL (Rug Puller) -->
+      <div class="panel" style="display:flex;flex-direction:column">
+        <div class="term-bar">
+          <div class="term-dots"><div class="term-dot" style="background:#ff5f57"></div><div class="term-dot" style="background:#ffbd2e"></div><div class="term-dot" style="background:#28c840"></div></div>
+          <span class="term-title">terminal — rug puller</span>
+        </div>
+        <div class="term-scroll" id="rugTerm"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT SIDEBAR — Bot Deployment Stack -->
+  <div class="rug-right">
+    <div class="rug-subtabs">
+      <div class="rug-subtab active" id="rugSubDeploy" onclick="showRugSubtab('deploy')">Deployment</div>
+      <div class="rug-subtab" id="rugSubWalletDev" onclick="showRugSubtab('walletdev')">Wallet Dev</div>
+      <div class="rug-subtab narrow" id="rugSubSettings" title="Rug Puller Settings" onclick="showRugSubtab('settings')">&#9881;</div>
+    </div>
+    <div class="ctrl-header" id="rugSideHdr">
+      <span class="ctrl-header-title" style="color:var(--red)">Deployment</span>
+      <span style="font-size:9px;color:var(--dim);font-family:'JetBrains Mono',monospace">STAGE 5</span>
+    </div>
+    <div id="rugPanelDeploy" style="flex:1;display:flex;flex-direction:column;min-height:0">
+      <div class="locked-panel" style="flex:1">
+        <div class="locked-icon">&#128274;</div>
+        <div class="locked-title">Bot Deployment Stack</div>
+        <div class="locked-desc">Active honeypot bots will appear here once Stages 3–5 are built. Each bot gets a live status card.</div>
+      </div>
+      <div style="padding:10px;border-top:1px solid #141820">
+        <div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;margin-bottom:8px">Stage Progress</div>
+        <div style="margin-bottom:6px">
+          <div style="display:flex;justify-content:space-between;font-size:10px;font-family:'JetBrains Mono',monospace;margin-bottom:2px"><span style="color:var(--green)">Stage 1</span><span style="color:var(--green)">Wallet Profiler</span></div>
+          <div class="score-bar" style="width:100%"><div class="score-fill" style="width:100%;background:var(--green)"></div></div>
+        </div>
+        <div style="margin-bottom:6px">
+          <div style="display:flex;justify-content:space-between;font-size:10px;font-family:'JetBrains Mono',monospace;margin-bottom:2px"><span style="color:var(--muted)">Stage 2</span><span style="color:var(--muted)">Pattern Cracker</span></div>
+          <div class="score-bar" style="width:100%"><div class="score-fill" style="width:0%;background:var(--orange)"></div></div>
+        </div>
+        <div style="margin-bottom:6px">
+          <div style="display:flex;justify-content:space-between;font-size:10px;font-family:'JetBrains Mono',monospace;margin-bottom:2px"><span style="color:var(--muted)">Stage 3</span><span style="color:var(--muted)">Honeypot Planner</span></div>
+          <div class="score-bar" style="width:100%"><div class="score-fill" style="width:0%;background:var(--orange)"></div></div>
+        </div>
+        <div style="margin-bottom:6px">
+          <div style="display:flex;justify-content:space-between;font-size:10px;font-family:'JetBrains Mono',monospace;margin-bottom:2px"><span style="color:var(--muted)">Stage 4</span><span style="color:var(--muted)">Puppet Wallets</span></div>
+          <div class="score-bar" style="width:100%"><div class="score-fill" style="width:0%;background:var(--orange)"></div></div>
+        </div>
+        <div style="margin-bottom:6px">
+          <div style="display:flex;justify-content:space-between;font-size:10px;font-family:'JetBrains Mono',monospace;margin-bottom:2px"><span style="color:var(--muted)">Stage 5</span><span style="color:var(--muted)">Kill Chain</span></div>
+          <div class="score-bar" style="width:100%"><div class="score-fill" style="width:0%;background:var(--red)"></div></div>
+        </div>
+      </div>
+    </div>
+    <div id="rugPanelWalletDev" style="display:none;flex:1;flex-direction:column;min-height:0;overflow:hidden">
+      <div class="ctrl-header" style="border-top:1px solid #141820">
+        <span class="ctrl-header-title" style="color:var(--cyan)">Wallet pool</span>
+        <span style="font-size:9px;color:var(--dim);font-family:'JetBrains Mono',monospace">WARM 5m + µ-tx</span>
+      </div>
+      <div id="walletDevBody" style="flex:1;overflow-y:auto;padding:10px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--dim)">
+        <div style="text-align:center;padding:16px;font-style:italic">Wallet Developer runs in Rug Puller (Live) with Helius + wallet configured.</div>
+      </div>
+    </div>
+    <div id="rugPanelSettings" style="display:none;flex:1;flex-direction:column;min-height:0;overflow:hidden">
+      <div class="ctrl-header" style="border-top:1px solid #141820">
+        <span class="ctrl-header-title" style="color:var(--orange)">Rug Puller Settings</span>
+        <span style="font-size:9px;color:var(--dim);font-family:'JetBrains Mono',monospace">SESSION</span>
+      </div>
+      <div style="flex:1;overflow-y:auto;padding:12px 14px 20px">
+        <div class="rug-set-row">
+          <div class="rug-set-label-row">
+            <span>Plan auto-trigger (bot score)</span>
+            <span class="rug-set-val" id="rugTriggerPct">Trigger: 70%</span>
+          </div>
+          <input type="range" class="rug-range" id="rugAutoPlanThr" min="0" max="100" step="1" value="70"
+            oninput="onRugPlanTriggerInput(this.value)" />
+        </div>
+        <div class="rug-set-row">
+          <div class="rug-set-label-row">
+            <span>Aggression level</span>
+          </div>
+          <select class="rug-select" id="rugAggression" onchange="onRugAggressionChange()">
+            <option value="conservative">Conservative — lower projected PnL</option>
+            <option value="standard" selected>Standard</option>
+            <option value="degenerate">Degenerate — higher projected PnL</option>
+          </select>
+        </div>
+        <div class="rug-set-row">
+          <div class="rug-set-label-row">
+            <span>Min wallet age (suspects table)</span>
+            <span class="rug-set-val" id="rugWalletAgeLbl">Min age: 0 min</span>
+          </div>
+          <input type="range" class="rug-range" id="rugMinWalletAge" min="0" max="60" step="1" value="0"
+            oninput="onRugMinWalletAgeInput(this.value)" />
+        </div>
+        <div class="rug-set-row" style="margin-bottom:8px">
+          <div class="rug-set-label-row">
+            <span>Auto-approve plans</span>
+          </div>
+          <div class="rug-toggle-line">
+            <div class="rug-toggle-desc">When on, new auto-generated plans skip the manual Approve step (dangerous in live trading).</div>
+            <label class="rug-toggle">
+              <input type="checkbox" id="rugAutoApprove" onchange="onRugAutoApproveChange(this)" />
+              <span class="rug-toggle-ui"></span>
+            </label>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let ws, trades=[], chartLabels=[], chartVals=[], pnlChart, reconnTimer;
+let currentConfig = {};
+let customPresets = [];
+let selectedMode = 'paper';
+let modeConfirmed = false;
+let isRugPullerMode = false;
+let botSuspectsData = [];
+let validationState = { key: 'pending', rpc: 'pending', rust: 'pending' };
+let closedPlanTabIds = new Set();
+let statsMiniChart = null;
+let rugSettingsTimer = null;
+let rugAutoApproveSessionOk = false;
+let tradingPaused = false;
+let lastExecutorType = 'paper';
+let startupHints = {};
+const RUST_WIN_SOUND_LS = 'bigal_rust_win_sound';
+const RUST_LOSS_SOUND_LS = 'bigal_rust_loss_sound';
+const RUST_TRADE_WIN_MS = 30000;
+const RUST_TRADE_LOSS_MS = 20000;
+let _activeTradeSound = null;
+let _tradeSoundEndTimer = null;
+
+// ---- Startup Modal ----
+
+function selectMode(mode) {
+  selectedMode = mode;
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('modeBtn_' + mode).classList.add('active');
+
+  if (mode === 'paper') {
+    sendModeSelect('paper');
+  } else if (mode === 'rug_puller_test') {
+    sendModeSelect('rug_puller_test');
+  } else if (mode === 'analysis') {
+    sendModeSelect('analysis');
+  } else if (mode === 'rug_puller_live') {
+    // Live rug puller — needs wallet config for stages 4-5
+    goToStep2(mode);
+  } else {
+    // Live modes — show config step
+    goToStep2(mode);
+  }
+}
+
+function sendModeSelect(mode) {
+  const payload = JSON.stringify({ type: 'mode_select', mode: mode, private_key: '' });
+  if (ws && ws.readyState === 1) {
+    ws.send(payload);
+  } else {
+    // WS not ready — show feedback and retry
+    const btn = document.getElementById('modeBtn_' + mode);
+    if (btn) {
+      const origLabel = btn.querySelector('.mode-btn-desc');
+      if (origLabel) origLabel.textContent = 'Connecting to backend...';
+    }
+    let attempts = 0;
+    const retry = setInterval(() => {
+      attempts++;
+      if (ws && ws.readyState === 1) {
+        ws.send(payload);
+        clearInterval(retry);
+      } else if (attempts > 10) {
+        clearInterval(retry);
+        if (btn) {
+          const lbl = btn.querySelector('.mode-btn-desc');
+          if (lbl) lbl.textContent = 'Connection failed — restart bot and refresh';
+        }
+      }
+    }, 500);
+  }
+}
+
+function refreshCfgEnvBanner(mode) {
+  const box = document.getElementById('cfgEnvBanner');
+  if (!box) return;
+  const h = startupHints || {};
+  const showRust = mode === 'zmq_rust' || mode === 'rug_puller_live';
+  box.innerHTML = '';
+  const addLine = (html) => {
+    const d = document.createElement('div');
+    d.style.cssText = 'margin-bottom:8px;line-height:1.5';
+    d.innerHTML = html;
+    box.appendChild(d);
+  };
+  if (h.helius_ready) {
+    addLine('<strong>Helius</strong> — HELIUS_RPC_URL is already set on the server. The API key field below is only needed to <em>override</em> that URL for this session.');
+  } else {
+    addLine('<strong>Helius</strong> — Paste an API key below, or set HELIUS_RPC_URL in the environment / <code>.env</code> before launch.');
+  }
+  if (h.wallet_env) {
+    addLine('<strong>Wallet</strong> — BIGAL_PRIVATE_KEY is set in the environment. The private key box below is optional (use it to override for this session).');
+  } else if (h.keypair_file) {
+    addLine('<strong>Wallet</strong> — keypair.txt found next to the bot. You may leave the key box blank.');
+  } else {
+    addLine('<strong>Wallet</strong> — Paste a key, set BIGAL_PRIVATE_KEY on the server, or add keypair.txt.');
+  }
+  if (showRust) {
+    if (h.grpc_env || h.grpc_token_env) {
+      addLine('<strong>gRPC</strong> — GRPC_ENDPOINT / GRPC_X_TOKEN may already be set via environment. Fields below override when filled.');
+    } else {
+      addLine('<strong>gRPC</strong> — Optional LaserStream / Yellowstone fields; only needed if you use them.');
+    }
+    if (h.jito_env) {
+      addLine('<strong>Jito</strong> — JITO_BLOCK_ENGINE may be set in the environment. The dropdown overrides when you connect.');
+    } else {
+      addLine('<strong>Jito</strong> — Pick the closest block engine; default is US East (NY).');
+    }
+    const sc = document.getElementById('vSidecar');
+    if (sc && h.helius_ready) {
+      setFieldStatus('vSidecar', 'ok', 'Sidecar can use Helius from environment or HELIUS_API_KEY');
+    }
+  }
+  box.style.display = 'block';
+}
+
+function goToStep2(mode) {
+  document.getElementById('step1').classList.remove('active');
+  document.getElementById('step2').classList.add('active');
+  document.getElementById('startupModal').classList.add('dimmed');
+
+  const tag = document.getElementById('cfgModeTag');
+  // Show/hide advanced config fields based on mode
+  const showRustFields = (mode === 'zmq_rust' || mode === 'rug_puller_live');
+  document.getElementById('cfgRustField').style.display = showRustFields ? 'block' : 'none';
+  document.getElementById('cfgSidecarField').style.display = showRustFields ? 'block' : 'none';
+  document.getElementById('cfgGrpcField').style.display = showRustFields ? 'block' : 'none';
+  document.getElementById('cfgGrpcTokenField').style.display = showRustFields ? 'block' : 'none';
+  document.getElementById('cfgJitoField').style.display = showRustFields ? 'block' : 'none';
+
+  if (mode === 'zmq_rust') {
+    tag.textContent = 'RUST EXECUTOR';
+    tag.className = 'cfg-mode-tag rust';
+    tag.style.cssText = '';
+    // Rust auto-starts on submit — no probe needed here
+    validationState.rust = 'ok';
+  } else if (mode === 'rug_puller_live') {
+    tag.textContent = 'RUG PULLER (LIVE)';
+    tag.className = 'cfg-mode-tag legacy';
+    tag.style.cssText = 'color:var(--red);border-color:rgba(255,23,68,.3);background:rgba(255,23,68,.1)';
+    validationState.rust = 'ok';
+  } else {
+    tag.textContent = 'LEGACY';
+    tag.className = 'cfg-mode-tag legacy';
+    tag.style.cssText = '';
+    validationState.rust = 'ok';
+  }
+
+  // Reset validation
+  validationState = { key: 'pending', rpc: 'pending', rust: 'ok' };
+  setFieldStatus('vKey', 'pending', 'Waiting for input');
+  setFieldStatus('vRpc', 'pending', 'Waiting for input — uses existing config if blank');
+  document.getElementById('cfgKey').className = 'cfg-input';
+  document.getElementById('cfgRpc').className = 'cfg-input';
+  updateSubmitBtn();
+
+  // Auto-validate on typing (debounced)
+  const keyEl = document.getElementById('cfgKey');
+  const rpcEl = document.getElementById('cfgRpc');
+  keyEl.oninput = debounce(() => validateField('key', keyEl.value.trim()), 600);
+  rpcEl.oninput = debounce(() => validateField('rpc', rpcEl.value.trim()), 600);
+
+  refreshCfgEnvBanner(mode);
+  // Trigger initial validation (check keypair.txt, existing RPC config)
+  setTimeout(triggerInitialValidation, 200);
+}
+
+function goBackToStep1() {
+  document.getElementById('step2').classList.remove('active');
+  document.getElementById('step1').classList.add('active');
+  document.getElementById('startupModal').classList.remove('dimmed');
+}
+
+function setFieldStatus(id, state, msg) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const dotClass = state === 'ok' ? 'ok' : state === 'fail' ? 'fail' : state === 'checking' ? 'checking' : 'pending';
+  const msgClass = state === 'ok' ? 'ok' : state === 'fail' ? 'fail' : '';
+  el.innerHTML = `<span class="v-dot ${dotClass}"></span><span class="v-msg ${msgClass}">${esc(msg)}</span>`;
+}
+
+function validateField(field, value) {
+  if (field === 'key') {
+    if (!value) {
+      // Blank = use keypair.txt, ask backend to check
+      setFieldStatus('vKey', 'checking', 'Checking keypair.txt...');
+      document.getElementById('cfgKey').className = 'cfg-input';
+      validationState.key = 'checking';
+    } else {
+      setFieldStatus('vKey', 'checking', 'Validating key format...');
+      document.getElementById('cfgKey').className = 'cfg-input';
+      validationState.key = 'checking';
+    }
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'validate_field', field: 'private_key', value: value }));
+    } else {
+      validationState.key = 'pending';
+      setFieldStatus('vKey', 'pending', 'Waiting for dashboard WebSocket — reconnecting...');
+    }
+  } else if (field === 'rpc') {
+    if (!value) {
+      setFieldStatus('vRpc', 'ok', 'Using existing Helius config');
+      document.getElementById('cfgRpc').className = 'cfg-input valid';
+      validationState.rpc = 'ok';
+    } else {
+      setFieldStatus('vRpc', 'checking', 'Validating RPC endpoint...');
+      document.getElementById('cfgRpc').className = 'cfg-input';
+      validationState.rpc = 'checking';
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'validate_field', field: 'rpc_key', value: value }));
+      } else {
+        validationState.rpc = 'pending';
+        setFieldStatus('vRpc', 'pending', 'Waiting for dashboard WebSocket...');
+      }
+    }
+  }
+  updateSubmitBtn();
+}
+
+function handleValidationResult(data) {
+  const { field, status, message } = data;
+  if (field === 'private_key') {
+    validationState.key = status;
+    setFieldStatus('vKey', status, message);
+    document.getElementById('cfgKey').className = 'cfg-input ' + (status === 'ok' ? 'valid' : status === 'fail' ? 'invalid' : '');
+  } else if (field === 'rpc_key') {
+    validationState.rpc = status;
+    setFieldStatus('vRpc', status, message);
+    document.getElementById('cfgRpc').className = 'cfg-input ' + (status === 'ok' ? 'valid' : status === 'fail' ? 'invalid' : '');
+  } else if (field === 'rust_executor') {
+    validationState.rust = status;
+    setFieldStatus('vRust', status, message);
+  } else if (field === 'sidecar') {
+    // Sidecar is non-critical — show status but don't block submit
+    setFieldStatus('vSidecar', status, message);
+  }
+  updateSubmitBtn();
+}
+
+function updateSubmitBtn() {
+  const btn = document.getElementById('submitBtn');
+  const allOk = Object.values(validationState).every(s => s === 'ok');
+  const anyFail = Object.values(validationState).some(s => s === 'fail');
+  const anyChecking = Object.values(validationState).some(s => s === 'checking');
+  btn.disabled = !allOk;
+  if (anyChecking) btn.textContent = 'VALIDATING...';
+  else if (anyFail) btn.textContent = 'FIX ERRORS ABOVE';
+  else if (allOk) btn.textContent = selectedMode === 'zmq_rust' ? 'CONNECT (RUST)' : 'CONNECT (LIVE)';
+  else btn.textContent = 'FILL REQUIRED FIELDS';
+}
+
+function submitConfig() {
+  const btn = document.getElementById('submitBtn');
+  if (!ws || ws.readyState !== 1) {
+    addLog({ time: ts(), msg: 'Dashboard WebSocket not connected — refresh the page', level: 'warn' });
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = selectedMode === 'zmq_rust' ? 'STARTING EXECUTOR...' : 'CONNECTING...';
+  // Update Rust status to show it's starting
+  if (selectedMode === 'zmq_rust') {
+    setFieldStatus('vRust', 'checking', 'Starting Rust executor...');
+    setFieldStatus('vSidecar', 'checking', 'Waiting...');
+  }
+  const key = document.getElementById('cfgKey').value.trim();
+  const rpc = document.getElementById('cfgRpc').value.trim();
+  const grpc = document.getElementById('cfgGrpc').value.trim();
+  const grpcToken = document.getElementById('cfgGrpcToken').value.trim();
+  const jito = document.getElementById('cfgJito').value;
+  ws.send(JSON.stringify({
+    type: 'mode_select',
+    mode: selectedMode,
+    private_key: key,
+    rpc_key: rpc,
+    grpc_endpoint: grpc || '',
+    grpc_token: grpcToken || '',
+    jito_engine: jito || ''
+  }));
+}
+
+function dismissModal() {
+  const modal = document.getElementById('startupModal');
+  modal.classList.add('hidden');
+  setTimeout(() => { modal.style.display = 'none'; }, 400);
+  modeConfirmed = true;
+}
+
+function togglePause(){
+  if(!ws||ws.readyState!==1)return;
+  tradingPaused=!tradingPaused;
+  ws.send(JSON.stringify({type:'pause_trading',paused:tradingPaused}));
+  updatePauseUI(tradingPaused);
+}
+function updatePauseUI(paused){
+  tradingPaused=paused;
+  const btn=document.getElementById('pauseBtn');
+  const icon=document.getElementById('pauseIcon');
+  const lbl=document.getElementById('pauseLbl');
+  if(!btn)return;
+  if(paused){btn.classList.add('paused');icon.textContent='⏸';lbl.textContent='PAUSED'}
+  else{btn.classList.remove('paused');icon.textContent='▶';lbl.textContent='ACTIVE'}
+}
+
+function openModeSwitch() {
+  if (!modeConfirmed) return;
+  const ms = document.getElementById('modeSwitchModal');
+  ms.style.display = 'flex';
+  ms.classList.remove('hidden');
+}
+
+function closeModeSwitchModal() {
+  const ms = document.getElementById('modeSwitchModal');
+  ms.classList.add('hidden');
+  setTimeout(() => { ms.style.display = 'none'; }, 400);
+}
+
+function confirmModeSwitchTerminate() {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'prepare_mode_switch' }));
+  }
+  closeModeSwitchModal();
+}
+
+function debounce(fn, ms) {
+  let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
+function throttle(fn, ms) {
+  let last = 0, pending = null;
+  return (...a) => {
+    const now = Date.now();
+    if (now - last >= ms) { last = now; fn(...a); }
+    else { clearTimeout(pending); pending = setTimeout(() => { last = Date.now(); fn(...a); }, ms - (now - last)); }
+  };
+}
+
+// Trigger initial key validation when step2 opens (check keypair.txt)
+function triggerInitialValidation() {
+  refreshCfgEnvBanner(selectedMode);
+  validateField('key', document.getElementById('cfgKey').value.trim());
+  const rpcVal = document.getElementById('cfgRpc').value.trim();
+  if (!rpcVal && startupHints && startupHints.helius_ready) {
+    setFieldStatus('vRpc', 'ok', 'Using HELIUS from server environment');
+    document.getElementById('cfgRpc').className = 'cfg-input valid';
+    validationState.rpc = 'ok';
+  } else {
+    validateField('rpc', rpcVal);
+  }
+  updateSubmitBtn();
+}
+
+// Slider definitions: key, label, min, max, step, unit, format
+const SLIDERS = [
+  {key:'sl',       label:'Stop Loss',       min:5,    max:25,   step:1,    unit:'%',   row:'sl_row'},
+  {key:'tp1',      label:'Take Profit 1',   min:5,    max:30,   step:1,    unit:'%',   row:'tp1_row'},
+  {key:'tp2',      label:'Take Profit 2',   min:10,   max:60,   step:5,    unit:'%',   row:'tp2_row'},
+  {key:'max_hold', label:'Max Hold Time',   min:15,   max:180,  step:5,    unit:'s',   row:'max_hold_row'},
+  {key:'trail_min',label:'Trail Trigger',   min:3,    max:25,   step:1,    unit:'%',   row:'trail_min_row'},
+  {key:'trail_peak',label:'Trail From Peak',min:2,    max:15,   step:1,    unit:'%',   row:'trail_peak_row'},
+  {key:'entry_buyers',label:'Min Buyers',   min:1,    max:8,    step:1,    unit:'',    row:'entry_buyers_row'},
+  {key:'entry_vol',label:'Min Buy Volume',  min:0.2,  max:3.0,  step:0.1,  unit:' SOL',row:'entry_vol_row'},
+  {key:'sell_ratio',label:'Max Sell Ratio', min:0.10, max:0.70, step:0.05, unit:'',    row:'sell_ratio_row', fmt:v=>(v*100).toFixed(0)+'%'},
+  {key:'net_buy',  label:'Min Net Buy',     min:0.05, max:1.0,  step:0.05, unit:' SOL',row:'net_buy_row'},
+  {key:'max_pump', label:'Max Pump',        min:20,   max:100,  step:5,    unit:'%',   row:'max_pump_row'},
+  {key:'min_age',  label:'Min Token Age',   min:1,    max:15,   step:1,    unit:'s',   row:'min_age_row'},
+  {key:'min_pool', label:'Min Pool',        min:0.1,  max:2.0,  step:0.1,  unit:' SOL',row:'min_pool_row'},
+  {key:'bc_min',   label:'BC Min Progress', min:0,    max:10,   step:0.5,  unit:'%',   row:'bc_min_row'},
+  {key:'bc_max',   label:'BC Max Progress', min:5,    max:50,   step:1,    unit:'%',   row:'bc_max_row'},
+  {key:'moonbag_pct',label:'Moonbag %',    min:0,    max:25,   step:1,    unit:'%',   row:'moonbag_pct_row'},
+  {key:'moonbag_expire',label:'Moonbag Expire',min:30,max:300, step:10,   unit:'s',   row:'moonbag_expire_row'},
+  {key:'moonbag_sl',label:'Moonbag Stop Loss',min:5,  max:30,   step:1,    unit:'%',   row:'moonbag_sl_row'},
+  {key:'moonbag_trail',label:'Moonbag Trail',min:5,   max:40,   step:1,    unit:'%',   row:'moonbag_trail_row'},
+  {key:'candidate_age',label:'Candidate Max Age',min:15,max:120,step:5,   unit:'s',   row:'candidate_age_row'},
+  {key:'velocity_check',label:'Velocity Check',min:0, max:1,    step:1,    unit:'',    row:'velocity_check_row', fmt:v=>v==1?'ON':'OFF'},
+  {key:'velocity_drop',label:'Max Tick Drop',min:2,  max:15,   step:1,    unit:'%',   row:'velocity_drop_row'},
+  {key:'anti_manip',label:'Anti-Manipulation',min:0,  max:1,    step:1,    unit:'',    row:'anti_manip_row', fmt:v=>v==1?'ON':'OFF'},
+  {key:'min_wallet_diversity',label:'Wallet Diversity',min:0.1,max:0.9,step:0.1,unit:'',row:'min_wallet_diversity_row', fmt:v=>(v*100).toFixed(0)+'%'},
+  {key:'max_repeat_wallets',label:'Max Repeat Wallets',min:1,max:8,step:1,unit:'',  row:'max_repeat_wallets_row'},
+  {key:'random_skip_pct',label:'Random Skip',min:0,   max:30,   step:1,    unit:'%',   row:'random_skip_pct_row'},
+  {key:'max_positions',label:'Max Positions',min:1,   max:15,   step:1,    unit:'',    row:'max_positions_row'},
+  {key:'trade_size',label:'Trade Size',     min:0.01, max:0.10, step:0.01, unit:' SOL',row:'trade_size_row'},
+  {key:'cooldown_losses',label:'Cooldown After',min:2,max:15,  step:1,    unit:' losses',row:'cooldown_losses_row'},
+  {key:'cooldown_sec',label:'Cooldown Duration',min:5,max:60,  step:5,    unit:'s',   row:'cooldown_sec_row'},
+  // Strategy mode manual values
+  {key:'manual_tip',label:'Manual Tip',min:0.001,max:0.02,step:0.001,unit:' SOL',row:'manual_tip_row'},
+  {key:'manual_min_liquidity',label:'Manual Min Liquidity',min:0.1,max:3.0,step:0.1,unit:' SOL',row:'manual_min_liquidity_row'},
+  {key:'manual_entry_progress',label:'Manual Entry BC',min:0.5,max:10,step:0.5,unit:'%',row:'manual_entry_progress_row'},
+  // Strategy mode hybrid overrides (0=adaptive, 1=use manual)
+  {key:'override_tip',label:'Override Tip',min:0,max:1,step:1,unit:'',row:'override_tip_row',fmt:v=>v==1?'MANUAL':'ADAPTIVE'},
+  {key:'override_liquidity',label:'Override Liquidity',min:0,max:1,step:1,unit:'',row:'override_liquidity_row',fmt:v=>v==1?'MANUAL':'ADAPTIVE'},
+  {key:'override_entry',label:'Override Entry',min:0,max:1,step:1,unit:'',row:'override_entry_row',fmt:v=>v==1?'MANUAL':'ADAPTIVE'},
+];
+
+function fmtVal(s, v) {
+  if (s.fmt) return s.fmt(v);
+  const n = Number(v);
+  if (s.step < 1) return n.toFixed(s.step < 0.1 ? 2 : 1) + (s.unit||'');
+  return n + (s.unit||'');
+}
+
+function buildSliders() {
+  SLIDERS.forEach(s => {
+    const el = document.getElementById(s.row);
+    if (!el) return;
+    const val = currentConfig[s.key] !== undefined ? currentConfig[s.key] : s.min;
+    el.innerHTML = `
+      <div class="ctrl-label">
+        <span class="ctrl-name">${s.label}</span>
+        <span class="ctrl-val" id="val_${s.key}">${fmtVal(s, val)}</span>
+      </div>
+      <input type="range" id="slider_${s.key}" min="${s.min}" max="${s.max}" step="${s.step}" value="${val}"
+        oninput="onSliderInput('${s.key}', this.value)"
+        onchange="onSliderChange('${s.key}', this.value)">
+    `;
+  });
+}
+
+function onSliderInput(key, val) {
+  const s = SLIDERS.find(x => x.key === key);
+  if (s) document.getElementById('val_'+key).textContent = fmtVal(s, val);
+}
+
+function onSliderChange(key, val) {
+  const s = SLIDERS.find(x => x.key === key);
+  const numVal = s && s.step < 1 ? parseFloat(val) : parseInt(val);
+  currentConfig[key] = numVal;
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({type: 'config_update', data: {[key]: numVal}}));
+  }
+}
+
+function syncSliders(config) {
+  currentConfig = {...config};
+  SLIDERS.forEach(s => {
+    const slider = document.getElementById('slider_'+s.key);
+    const valEl = document.getElementById('val_'+s.key);
+    if (slider && config[s.key] !== undefined) {
+      slider.value = config[s.key];
+      if (valEl) valEl.textContent = fmtVal(s, config[s.key]);
+    }
+  });
+  // Sync strategy mode dropdown
+  const sel = document.getElementById('strategyModeSelect');
+  if (sel && config.strategy_mode) {
+    sel.value = config.strategy_mode;
+    updateStrategyUI(config.strategy_mode);
+  }
+}
+
+function onStrategyModeChange(mode) {
+  currentConfig.strategy_mode = mode;
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({type: 'config_update', data: {strategy_mode: mode}}));
+  }
+  updateStrategyUI(mode);
+}
+
+function updateStrategyUI(mode) {
+  const manualVals = document.getElementById('strategyManualValues');
+  const overrides = document.getElementById('strategyOverrides');
+  if (!manualVals || !overrides) return;
+  if (mode === 'manual') {
+    manualVals.style.display = '';
+    overrides.style.display = 'none';
+  } else if (mode === 'adaptive') {
+    manualVals.style.display = 'none';
+    overrides.style.display = 'none';
+  } else {
+    manualVals.style.display = '';
+    overrides.style.display = '';
+  }
+}
+
+function applyPreset(name) {
+  if (!name) return;
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({type: 'preset', name: name}));
+  }
+}
+
+function savePreset() {
+  const name = document.getElementById('presetName').value.trim();
+  if (!name) return;
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({type: 'save_preset', name: name, data: currentConfig}));
+    document.getElementById('presetName').value = '';
+  }
+}
+
+function manualSell(mint, symbol) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({type: 'manual_sell', mint: mint}));
+  }
+}
+
+function deletePreset() {
+  const sel = document.getElementById('presetSelect');
+  const name = sel.value;
+  if (!name || !customPresets.includes(name)) {
+    return;
+  }
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({type: 'delete_preset', name: name}));
+    sel.value = '';
+  }
+}
+
+function updatePresetList(data) {
+  const sel = document.getElementById('presetSelect');
+  const curVal = sel.value;
+  customPresets = data.custom_presets || [];
+  const builtIn = ['aggressive','balanced','conservative','scalper','momentum','data_optimized'];
+  sel.innerHTML = '<option value="">-- Select Preset --</option>';
+  builtIn.forEach(p => {
+    sel.innerHTML += `<option value="${p}">${p.charAt(0).toUpperCase()+p.slice(1)}${p==='balanced'?' (Default)':''}</option>`;
+  });
+  if (customPresets.length) {
+    sel.innerHTML += '<option disabled>--- Custom ---</option>';
+    customPresets.forEach(p => {
+      sel.innerHTML += `<option value="${p}">${p}</option>`;
+    });
+  }
+  if (curVal) sel.value = curVal;
+}
+
+// ---- Chart, Stats, Trades, Terminal (same as original) ----
+
+function initChart(){
+  const ctx=document.getElementById('chart').getContext('2d');
+  const g=ctx.createLinearGradient(0,0,0,180);
+  g.addColorStop(0,'rgba(0,230,118,.18)');g.addColorStop(1,'rgba(0,230,118,.01)');
+  pnlChart=new Chart(ctx,{
+    type:'line',
+    data:{labels:chartLabels,datasets:[{data:chartVals,borderColor:'#00e676',borderWidth:1.5,backgroundColor:g,fill:true,pointRadius:0,pointHoverRadius:3,tension:.3}]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{
+        backgroundColor:'#0d0f12',borderColor:'#1e2530',borderWidth:1,
+        titleFont:{family:"'JetBrains Mono',monospace",size:10},bodyFont:{family:"'JetBrains Mono',monospace",size:11},
+        titleColor:'#7a8599',bodyColor:'#00e676',padding:8,displayColors:false,
+        callbacks:{label:c=>`PnL: ${c.parsed.y>=0?'+':''}${c.parsed.y.toFixed(4)} SOL`}
+      }},
+      scales:{
+        x:{grid:{color:'#141820',drawBorder:false},ticks:{color:'#3a4250',font:{family:"'JetBrains Mono',monospace",size:9},maxTicksLimit:8}},
+        y:{grid:{color:'#141820',drawBorder:false},ticks:{color:ctx=>ctx.tick.value>=0?'#00e676':'#ff1744',font:{family:"'JetBrains Mono',monospace",size:9},callback:v=>`${v>=0?'+':''}${v.toFixed(3)}`}}
+      },
+      interaction:{intersect:false,mode:'index'}
+    }
+  });
+}
+
+function updateStats(d){
+  const $=id=>document.getElementById(id);
+  if (d && d.executor_type) lastExecutorType = d.executor_type;
+  $('sBalance').innerHTML=`${d.balance.toFixed(4)}<span class="stat-u">SOL</span>`;
+  const pc=d.pnl>=0?'var(--green)':'var(--red)';
+  $('sPnl').innerHTML=`${d.pnl>=0?'+':''}${d.pnl.toFixed(4)}<span class="stat-u">SOL</span>`;$('sPnl').style.color=pc;
+  const wr=d.win_rate||0;$('sWR').innerHTML=`${wr.toFixed(1)}<span class="stat-u">%</span>`;$('sWR').style.color=wr>=50?'var(--green)':'var(--orange)';
+  $('sWL').textContent=`${d.wins} / ${d.losses}`;
+  $('sPos').textContent=d.open_positions;$('posCount').textContent=d.open_positions;
+  $('sMB').textContent=d.moonbags||0;
+  const cd=d.cooldown_remaining||0;  $('sCD').textContent=cd>0?`${cd.toFixed(0)}s`:'--';$('sCD').style.color=cd>0?'var(--orange)':'var(--dim)';
+
+  const ddB=document.getElementById('ddBalance');
+  const ddP=document.getElementById('ddPnl');
+  const ddWD=document.getElementById('ddWalletDelta');
+  if(ddB)ddB.textContent=`${d.balance.toFixed(4)} SOL`;
+  if(ddP){
+    const pc=d.pnl>=0?'var(--green)':'var(--red)';
+    ddP.textContent=`${d.pnl>=0?'+':''}${d.pnl.toFixed(4)} SOL`;
+    ddP.style.color=pc;
+  }
+  if(ddWD){
+    if(d.wallet_delta_sol!==undefined&&d.wallet_delta_sol!==null&&!Number.isNaN(d.wallet_delta_sol)){
+      ddWD.textContent=`${d.wallet_delta_sol>=0?'+':''}${d.wallet_delta_sol.toFixed(4)} SOL`;
+      ddWD.style.color=d.wallet_delta_sol>=0?'var(--green)':'var(--red)';
+    }else{
+      ddWD.textContent='--';
+      ddWD.style.color='var(--dim)';
+    }
+  }
+  const wdEl=$('sWalletDelta');
+  const wdStat=document.getElementById('walletDeltaStat');
+  if(wdEl&&wdStat){
+    if(d.wallet_delta_sol!==undefined&&d.wallet_delta_sol!==null&&!Number.isNaN(d.wallet_delta_sol)){
+      wdStat.style.display='';
+      wdEl.innerHTML=`${d.wallet_delta_sol>=0?'+':''}${d.wallet_delta_sol.toFixed(4)}<span class="stat-u">SOL</span>`;
+      wdEl.style.color=d.wallet_delta_sol>=0?'var(--green)':'var(--red)';
+    }else{wdStat.style.display='none';}
+  }
+  if(statsMiniChart&&chartVals.length){
+    statsMiniChart.data.labels=chartLabels.slice(-40);
+    statsMiniChart.data.datasets[0].data=chartVals.slice(-40);
+    statsMiniChart.update('none');
+  }
+
+  // Latency pipeline (only visible in Rust executor mode)
+  const lat=d.latency||{};const exType=d.executor_type||'paper';
+  const latPipe=$('latencyPipeline');
+  if(exType==='zmq_rust'){
+    latPipe.style.display='flex';
+    const latColor=v=>v<100?'var(--green)':v<300?'var(--orange)':'var(--red)';
+    const setLat=(id,v)=>{const el=$(id);if(el){el.textContent=v>0?Math.round(v):'--';el.style.color=v>0?latColor(v):'var(--dim)'}};
+    setLat('latZmq',lat.zmq_ms);setLat('latBuild',lat.build_ms);setLat('latLand',lat.land_ms);
+    const tot=lat.total_ms||0;$('latTotal').textContent=tot>0?Math.round(tot):'--';$('latTotal').style.color=tot>0?'var(--cyan)':'var(--dim)';
+  }else{latPipe.style.display='none'}
+
+  // Update rug puller stats if profiler data present
+  if(d.profiler_stats && isRugPullerMode){
+    updateRugStats(d.profiler_stats);
+  }
+
+  const ps=d.positions||[];const grid=$('posGrid');
+  if(ps.length){
+    grid.innerHTML=ps.map(p=>{
+      const c=p.pnl_pct>=0?'var(--green)':'var(--red)';
+      const mb=p.is_moonbag?' [MB]':'';
+      return `<div class="pos-chip"><div><span class="pos-name">${p.symbol}${mb}</span> <span class="pos-meta">${p.hold_time.toFixed(0)}s · ${p.size_sol} SOL${p.partial_sold?' · half sold':''}</span></div><div class="pos-right"><span style="color:${c};font-weight:600">${p.pnl_pct>=0?'+':''}${p.pnl_pct.toFixed(1)}%</span><button class="sell-btn" onclick="manualSell('${p.mint}','${esc(p.symbol)}')">SELL</button></div></div>`;
+    }).join('');
+  }else{grid.innerHTML='<div class="pos-empty">No open positions</div>';}
+}
+
+const _throttledRenderTrades = throttle(function(){ renderTrades(); }, 250);
+const _throttledRenderBots = throttle(function(data){ renderBotTable(data); }, 250);
+
+function addTrade(t){
+  trades.unshift(t);if(trades.length>80)trades.length=80;
+  tryRustWinSound(t);
+  tryRustLossSound(t);
+  chartLabels.push(t.time);chartVals.push(t.cum_pnl);
+  if(chartLabels.length>80){chartLabels.shift();chartVals.shift();}
+  if(pnlChart){
+    pnlChart.data.labels=chartLabels;pnlChart.data.datasets[0].data=chartVals;
+    const last=chartVals[chartVals.length-1]||0;
+    pnlChart.data.datasets[0].borderColor=last>=0?'#00e676':'#ff1744';
+    const ctx=pnlChart.ctx,g=ctx.createLinearGradient(0,0,0,180);
+    g.addColorStop(0,last>=0?'rgba(0,230,118,.18)':'rgba(255,23,68,.18)');
+    g.addColorStop(1,last>=0?'rgba(0,230,118,.01)':'rgba(255,23,68,.01)');
+    pnlChart.data.datasets[0].backgroundColor=g;pnlChart.update('none');
+  }
+  _throttledRenderTrades();
+}
+
+function renderTrades(){
+  document.getElementById('tradeCount').textContent=trades.length;
+  document.getElementById('tBody').innerHTML=trades.slice(0,40).map(t=>{
+    const w=t.pnl_pct>=0,c=w?'var(--green)':'var(--red)',b=w?'badge-w':'badge-l';
+    return `<tr><td style="color:var(--dim);font-size:10px">${t.time}</td><td style="color:var(--bright)">${t.symbol}</td><td style="color:${c};font-weight:600">${w?'+':''}${t.pnl_pct.toFixed(1)}%</td><td style="color:${c}">${w?'+':''}${t.pnl_sol.toFixed(4)}</td><td style="color:var(--dim)">${t.hold_time}s</td><td><span class="badge ${b}">${t.reason}</span></td></tr>`;
+  }).join('');
+}
+
+function addLog(d){
+  const termId=isRugPullerMode?'rugTerm':'term';
+  const el=document.getElementById(termId);
+  if(!el)return;
+  const div=document.createElement('div');
+  div.innerHTML=`<span class="log-t">${d.time}</span><span class="log-${d.level}">${esc(d.msg)}</span>`;
+  el.appendChild(div);
+  while(el.children.length>250)el.removeChild(el.firstChild);
+  el.scrollTop=el.scrollHeight;
+}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+function isRustWinSoundEnabled(){
+  try { return localStorage.getItem(RUST_WIN_SOUND_LS) !== '0'; } catch (_) { return true; }
+}
+function isRustLossSoundEnabled(){
+  try { return localStorage.getItem(RUST_LOSS_SOUND_LS) !== '0'; } catch (_) { return true; }
+}
+function setRustWinSoundEnabled(on){
+  try { localStorage.setItem(RUST_WIN_SOUND_LS, on ? '1' : '0'); } catch (_) {}
+  updateWinSoundToggleUI();
+}
+function setRustLossSoundEnabled(on){
+  try { localStorage.setItem(RUST_LOSS_SOUND_LS, on ? '1' : '0'); } catch (_) {}
+  updateLossSoundToggleUI();
+}
+function updateWinSoundToggleUI(){
+  const btn = document.getElementById('winSoundBtn');
+  if (!btn) return;
+  const on = isRustWinSoundEnabled();
+  btn.textContent = on ? 'Win sound: on' : 'Win sound: off';
+  btn.classList.toggle('win-sound-off', !on);
+}
+function updateLossSoundToggleUI(){
+  const btn = document.getElementById('lossSoundBtn');
+  if (!btn) return;
+  const on = isRustLossSoundEnabled();
+  btn.textContent = on ? 'Loss sound: on' : 'Loss sound: off';
+  btn.classList.toggle('win-sound-off', !on);
+}
+function stopAllRustTradeSounds(){
+  const w = document.getElementById('rustWinAudio');
+  const l = document.getElementById('rustLossAudio');
+  if (w) { try { w.pause(); w.currentTime = 0; } catch (_) {} }
+  if (l) { try { l.pause(); l.currentTime = 0; } catch (_) {} }
+  if (_tradeSoundEndTimer) { clearTimeout(_tradeSoundEndTimer); _tradeSoundEndTimer = null; }
+  _activeTradeSound = null;
+}
+function startRustTradeClip(kind, el, durationMs){
+  if (!el) return;
+  stopAllRustTradeSounds();
+  _activeTradeSound = kind;
+  el.currentTime = 0;
+  el.play().catch(function () {});
+  _tradeSoundEndTimer = setTimeout(function () {
+    stopAllRustTradeSounds();
+  }, durationMs);
+}
+function tryRustWinSound(t){
+  if (!t || lastExecutorType !== 'zmq_rust') return;
+  if (!isRustWinSoundEnabled()) return;
+  const pct = Number(t.pnl_pct);
+  if (Number.isNaN(pct) || pct <= 10) return;
+  if (_activeTradeSound === 'win') return;
+  const a = document.getElementById('rustWinAudio');
+  if (!a) return;
+  startRustTradeClip('win', a, RUST_TRADE_WIN_MS);
+}
+function tryRustLossSound(t){
+  if (!t || lastExecutorType !== 'zmq_rust') return;
+  if (!isRustLossSoundEnabled()) return;
+  const pct = Number(t.pnl_pct);
+  if (Number.isNaN(pct) || pct >= 0) return;
+  if (_activeTradeSound === 'loss') return;
+  const a = document.getElementById('rustLossAudio');
+  if (!a) return;
+  startRustTradeClip('loss', a, RUST_TRADE_LOSS_MS);
+}
+function toggleWinSound(){
+  const next = !isRustWinSoundEnabled();
+  setRustWinSoundEnabled(next);
+  if (!next && _activeTradeSound === 'win') stopAllRustTradeSounds();
+}
+function toggleLossSound(){
+  const next = !isRustLossSoundEnabled();
+  setRustLossSoundEnabled(next);
+  if (!next && _activeTradeSound === 'loss') stopAllRustTradeSounds();
+}
+
+function setConn(on){
+  document.getElementById('dot').className=`dot ${on?'on':'off'}`;
+  document.getElementById('statusLbl').textContent=on?'CONNECTED':'DISCONNECTED';
+}
+
+// ---- Plan Approval UI ----
+
+let allPlans = [];
+let activePlanId = null;
+
+function closePlanTab(ev, planId) {
+  ev.stopPropagation();
+  closedPlanTabIds.add(planId);
+  if (activePlanId === planId) activePlanId = null;
+  renderPlans(allPlans);
+}
+
+function renderPlans(plans) {
+  if (!Array.isArray(plans)) return;
+  allPlans = plans;
+  const tabs = document.getElementById('planTabs');
+  const countEl = document.getElementById('planCount');
+  if (!tabs) return;
+
+  if (plans.length === 0) closedPlanTabIds.clear();
+
+  const visible = plans.filter(p => !closedPlanTabIds.has(p.plan_id));
+  const pending = plans.filter(p => p.status === 'planned').length;
+  if (countEl) countEl.textContent = pending > 0 ? pending + ' pending' : plans.length;
+
+  if (plans.length === 0) {
+    tabs.innerHTML = '<div id="planTabEmpty" style="color:var(--muted);font-size:10px;padding:6px 10px;font-style:italic">No plans yet \u2014 waiting for confirmed bots...</div>';
+    document.getElementById('planDetail').innerHTML = '';
+    activePlanId = null;
+    return;
+  }
+
+  if (visible.length === 0) {
+    tabs.innerHTML = '<div style="color:var(--muted);font-size:10px;padding:6px 10px;font-style:italic">All plan tabs closed \u2014 use orchestrator refresh or reopen from new plans</div>';
+    document.getElementById('planDetail').innerHTML = '';
+    return;
+  }
+
+  if (!activePlanId || !visible.find(p => p.plan_id === activePlanId)) {
+    const firstPending = visible.find(p => p.status === 'planned');
+    activePlanId = firstPending ? firstPending.plan_id : visible[0].plan_id;
+  }
+
+  tabs.innerHTML = visible.map(p => {
+    const active = p.plan_id === activePlanId ? ' active' : '';
+    const statusCls = p.status || 'planned';
+    const label = p.token_symbol || p.plan_id.slice(0, 6);
+    const idJs = JSON.stringify(p.plan_id);
+    return `<div class="plan-tab${active}" data-plan-id="${p.plan_id}" onclick="selectPlan(${idJs})"><span class="tab-status ${statusCls}"></span>${esc(label)}<button type="button" class="plan-tab-x" onclick="closePlanTab(event,${idJs})" title="Close tab">\u00d7</button></div>`;
+  }).join('');
+
+  renderPlanDetail();
+}
+
+function selectPlan(planId) {
+  activePlanId = planId;
+  document.querySelectorAll('.plan-tab').forEach(t => {
+    t.classList.toggle('active', t.getAttribute('data-plan-id') === planId);
+  });
+  renderPlanDetail();
+}
+
+function renderPlanDetail() {
+  const el = document.getElementById('planDetail');
+  if (!el) return;
+  const plan = allPlans.find(p => p.plan_id === activePlanId);
+  if (!plan) { el.innerHTML = ''; return; }
+
+  const statusColors = { planned: 'var(--orange)', approved: 'var(--green)', deploying: 'var(--cyan)', active: 'var(--cyan)', killed: 'var(--red)', rejected: 'var(--muted)', aborted: 'var(--muted)' };
+  const sc = statusColors[plan.status] || 'var(--muted)';
+  const ageSec = plan.created_at ? Math.round(Date.now() / 1000 - plan.created_at) : 0;
+  const ageFmt = ageSec < 60 ? ageSec + 's ago' : Math.round(ageSec / 60) + 'm ago';
+  const tagColors = { SYBIL: '#ff1744', VELOCITY: '#ff9100', PATTERN: '#00e5ff', HEURISTIC: '#b0bec5', DEV_DUMP: '#d500f9', MOCK: '#b388ff' };
+  const tagColor = tagColors[plan.trigger_tag] || 'var(--muted)';
+  const delta = plan.score_delta || 0;
+  const deltaStr = delta > 0 ? `<span style="color:var(--red)">\u2191${delta}%</span>` : delta < 0 ? `<span style="color:var(--green)">\u2193${Math.abs(delta)}%</span>` : '';
+  const devHtml = plan.dev_blacklisted ? `<span style="color:var(--red)">\u26a0 BLACKLISTED \u2014 ${plan.dev_rug_count} past rug${plan.dev_rug_count!==1?'s':''}</span>` : `<span style="color:var(--green)">Clean \u2014 0 rugs</span>`;
+  const pnl = plan.projected_pnl || 0;
+  const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+
+  let html = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="color:${sc};font-weight:600;font-size:12px;text-transform:uppercase">${plan.status}</span>
+        <span style="background:${tagColor}22;color:${tagColor};border:1px solid ${tagColor}44;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:600">${plan.trigger_tag||'?'}</span>
+      </div>
+      <span style="color:var(--dim);font-size:9px">${ageFmt}</span>
+    </div>
+    <div style="color:var(--muted);font-size:9.5px;margin-bottom:8px;font-style:italic">${esc(plan.trigger_reason||'')}</div>
+    ${plan.is_mock ? `<div style="background:rgba(179,136,255,.12);border:1px solid rgba(179,136,255,.35);border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:10px;line-height:1.45"><span style="color:#b388ff;font-weight:700;text-transform:uppercase;font-size:9px">Mock plan (test)</span>${plan.threat_summary ? `<div style="color:var(--bright);margin-top:6px"><strong>Threat</strong> \u2014 ${esc(plan.threat_summary)}</div>` : ''}${plan.mock_entry_summary ? `<div style="color:var(--dim);margin-top:6px"><strong>Entry</strong> \u2014 ${esc(plan.mock_entry_summary)}</div>` : ''}${plan.mock_exit_summary ? `<div style="color:var(--dim);margin-top:6px"><strong>Exit</strong> \u2014 ${esc(plan.mock_exit_summary)}</div>` : ''}</div>` : ''}
+
+    <div style="color:var(--muted);font-size:8px;text-transform:uppercase;letter-spacing:.5px;margin:8px 0 4px">Target</div>
+    <div class="plan-detail-row"><span class="lbl">Token</span><span class="val">${esc(plan.token_name||'\u2014')} (${esc(plan.token_symbol||'\u2014')})</span></div>
+    <div class="plan-detail-row"><span class="lbl">Target Wallet</span><span class="val">${esc(plan.target||'\u2014')}</span></div>
+    <div class="plan-detail-row"><span class="lbl">Threat Score</span><span class="val" style="color:${plan.target_score>=80?'var(--red)':'var(--orange)'}">${plan.target_score||0}% ${deltaStr}</span></div>
+    <div class="plan-detail-row"><span class="lbl">Confidence</span><span class="val">${Math.round((plan.confidence||0)*100)}%</span></div>
+    <div class="plan-detail-row"><span class="lbl">Dev Reputation</span><span class="val">${devHtml}</span></div>`;
+
+  if (plan.cluster_size >= 2 || plan.parent_wallet) {
+    html += `<div style="color:var(--muted);font-size:8px;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 4px">Cluster Intel</div>
+    <div class="plan-detail-row"><span class="lbl">Cluster Size</span><span class="val">${plan.cluster_size||0} wallets</span></div>`;
+    if (plan.parent_wallet) html += `<div class="plan-detail-row"><span class="lbl">Parent Wallet</span><span class="val"><a href="https://solscan.io/account/${plan.parent_wallet_full}" target="_blank" style="color:var(--cyan);text-decoration:none">${esc(plan.parent_wallet)}</a></span></div>`;
+    if (plan.cluster_sol_stake > 0) html += `<div class="plan-detail-row"><span class="lbl">Cluster SOL Stake</span><span class="val">${plan.cluster_sol_stake} SOL</span></div>`;
+  }
+
+  html += `
+    <div style="color:var(--muted);font-size:8px;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 4px">Execution Plan</div>
+    <div class="plan-detail-row"><span class="lbl">Initial Liquidity</span><span class="val">${plan.initial_liq||0} SOL</span></div>
+    <div class="plan-detail-row"><span class="lbl">Puppet Wallets</span><span class="val">${plan.puppet_count||0} wallets \u2014 ${plan.puppet_buys||0} txs</span></div>
+    <div class="plan-detail-row"><span class="lbl">Enemy Capital</span><span class="val" style="color:var(--orange)">${plan.total_puppet_sol||0} SOL deployed</span></div>
+    <div class="plan-detail-row"><span class="lbl">Expected Bot Buy</span><span class="val">${plan.expected_bot_buy||0} SOL</span></div>
+    <div class="plan-detail-row"><span class="lbl">Kill Threshold</span><span class="val" style="color:var(--red)">${plan.kill_threshold||0} SOL in pool</span></div>
+    <div class="plan-detail-row"><span class="lbl">Kill Timeout</span><span class="val">${plan.kill_timeout||0}s</span></div>
+    <div class="plan-detail-row"><span class="lbl">Jito Tip</span><span class="val">${plan.jito_tip_sol||0.005} SOL</span></div>
+    <div class="plan-detail-row"><span class="lbl">Slippage</span><span class="val">${(plan.slippage_bps||2000)/100}%</span></div>
+
+    <div style="color:var(--muted);font-size:8px;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 4px">Projected Outcome</div>
+    <div class="plan-detail-row"><span class="lbl">Projected PnL</span><span class="val" style="color:${pnlColor};font-weight:600;font-size:12px">${pnl>=0?'+':''}${pnl} SOL</span></div>`;
+
+  if (plan.bot_bought) html += `<div class="plan-detail-row"><span class="lbl">Bot Bought</span><span class="val" style="color:var(--green);font-weight:600">YES</span></div>`;
+  if (plan.extracted_sol > 0) html += `<div class="plan-detail-row"><span class="lbl">Extracted</span><span class="val" style="color:var(--green);font-weight:600">+${plan.extracted_sol} SOL</span></div>`;
+
+  if (plan.status === 'planned') {
+    html += `<div style="display:flex;gap:8px;margin-top:14px;justify-content:center">
+        <button class="plan-btn approve" onclick="approvePlan('${plan.plan_id}')">APPROVE DEPLOYMENT</button>
+        <button class="plan-btn reject" onclick="rejectPlan('${plan.plan_id}')">REJECT</button>
+      </div>`;
+  } else if (plan.status === 'approved') {
+    html += `<div style="text-align:center;margin-top:12px;color:var(--green);font-size:10px">Deploying puppets...</div>`;
+  } else if (plan.status === 'active') {
+    html += `<div style="text-align:center;margin-top:12px;color:var(--cyan);font-size:10px;animation:pulse 1.5s infinite">Watching for target buy...</div>`;
+  }
+
+  el.innerHTML = html;
+}
+
+function approvePlan(planId) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'approve_plan', plan_id: planId }));
+    const plan = allPlans.find(p => p.plan_id === planId);
+    if (plan) plan.status = 'approved';
+    // Auto-close approved tab and advance to next pending plan
+    closedPlanTabIds.add(planId);
+    activePlanId = null;
+    renderPlans(allPlans);
+  }
+}
+
+function rejectPlan(planId) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'reject_plan', plan_id: planId }));
+    const plan = allPlans.find(p => p.plan_id === planId);
+    if (plan) plan.status = 'rejected';
+    // Auto-close rejected tab and advance to next pending plan
+    closedPlanTabIds.add(planId);
+    activePlanId = null;
+    renderPlans(allPlans);
+  }
+}
+
+// ---- Rug Puller Rendering ----
+
+function renderBotTable(data){
+  if(!Array.isArray(data))return;
+  botSuspectsData=data;
+  const tbody=document.getElementById('botTableBody');
+  const countEl=document.getElementById('botCount');
+  if(!tbody)return;
+
+  const scored=data.filter(d=>d.status!=='WATCHING');
+  if(countEl)countEl.textContent=scored.length;
+
+  if(data.length===0){
+    tbody.innerHTML='<tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px;font-style:italic">Waiting for trade data — profiler needs 8+ buys per wallet to score...</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML=data.slice(0,40).map(b=>{
+    const sc=b.bot_score||0;
+    const barColor=sc>=80?'var(--red)':sc>=60?'var(--orange)':sc>=30?'var(--cyan)':'var(--muted)';
+    const stClass=b.status==='CONFIRMED'?'st-confirmed':b.status==='SUSPECTED'?'st-suspected':b.status==='SCORING'?'st-scoring':'st-watching';
+    const rowClass=b.status==='CONFIRMED'?'confirmed':b.status==='SUSPECTED'?'suspected':'';
+    const wf = b.wallet_full || '';
+    const planBtn = wf ? `<button type="button" class="sell-btn" data-plan-wallet="${wf.replace(/"/g, '&quot;')}" style="border-color:var(--orange);color:var(--orange);font-size:8px;padding:2px 5px" onclick="planSuspectPrompt(this)">Plan</button>` : '\u2014';
+    return `<tr class="${rowClass}">
+      <td style="color:var(--bright);font-size:10px">${esc(b.wallet)}</td>
+      <td style="color:var(--dim)">${b.buys}</td>
+      <td style="color:var(--dim)">${b.unique_tokens}</td>
+      <td style="color:var(--cyan)">${b.avg_sol}</td>
+      <td style="color:var(--dim)">${b.avg_timing}s</td>
+      <td><span style="color:${barColor};font-weight:600;font-size:10px">${sc.toFixed(0)}%</span><div class="score-bar"><div class="score-fill" style="width:${sc}%;background:${barColor}"></div></div></td>
+      <td><span class="st-badge ${stClass}">${b.status}</span></td>
+      <td>${planBtn}</td>
+    </tr>`;
+  }).join('');
+
+  // Update profiler overview panel
+  updateProfilerOverview(data);
+}
+
+function updateProfilerOverview(data){
+  const el=document.getElementById('profilerOverview');
+  if(!el)return;
+  const confirmed=data.filter(d=>d.status==='CONFIRMED');
+  const suspected=data.filter(d=>d.status==='SUSPECTED');
+  const scoring=data.filter(d=>d.status==='SCORING');
+  const watching=data.filter(d=>d.status==='WATCHING');
+
+  let html='';
+  if(confirmed.length>0){
+    html+=`<div style="font-size:10px;color:var(--red);font-weight:600;margin-bottom:4px">&#9760; ${confirmed.length} CONFIRMED BOT${confirmed.length>1?'S':''}</div>`;
+    confirmed.slice(0,3).forEach(b=>{
+      html+=`<div style="background:#1a0a0a;border:1px solid #3d1a1a;border-radius:4px;padding:6px 8px;font-family:'JetBrains Mono',monospace;font-size:10px;margin-bottom:4px">
+        <div style="display:flex;justify-content:space-between;margin-bottom:4px"><span style="color:var(--bright)">${esc(b.wallet)}</span><span style="color:var(--red);font-weight:600">${b.bot_score.toFixed(0)}%</span></div>
+        <div style="color:var(--dim);font-size:9px">${b.buys} buys · ${b.unique_tokens} tokens · ~${b.avg_sol} SOL · ~${b.avg_timing}s after create</div>
+        ${b.components?renderComponents(b.components):''}
+      </div>`;
+    });
+  }
+  if(suspected.length>0){
+    html+=`<div style="font-size:10px;color:var(--orange);font-weight:600;margin-top:6px;margin-bottom:4px">&#9888; ${suspected.length} SUSPECTED</div>`;
+  }
+  if(scoring.length>0){
+    html+=`<div style="font-size:10px;color:var(--cyan);margin-top:4px;margin-bottom:2px">${scoring.length} being scored · ${watching.length} watching</div>`;
+  }
+  if(!html){
+    html='<div style="color:var(--muted);font-size:11px;text-align:center;padding:20px;font-style:italic">Collecting wallet data...</div>';
+  }
+  el.innerHTML=html;
+}
+
+function renderComponents(comp){
+  if(!comp)return '';
+  const items=[
+    {k:'timing',l:'TIMING',c:'var(--cyan)'},
+    {k:'amount',l:'AMOUNT',c:'var(--green)'},
+    {k:'frequency',l:'FREQ',c:'var(--orange)'},
+    {k:'diversity',l:'DIVERSITY',c:'var(--cyan)'},
+    {k:'buy_dom',l:'BUY DOM',c:'var(--green)'},
+    {k:'pattern',l:'PATTERN',c:'var(--red)'},
+  ];
+  return '<div style="margin-top:4px">'+items.map(i=>{
+    const v=comp[i.k]||0;
+    return `<div class="comp-row"><span class="comp-label">${i.l}</span><div class="comp-bar"><div class="comp-fill" style="width:${v}%;background:${i.c}"></div></div><span style="font-size:8px;color:var(--dim);width:24px;text-align:right">${v.toFixed(0)}</span></div>`;
+  }).join('')+'</div>';
+}
+
+function clearPlanButtonLoading(wallet) {
+  document.querySelectorAll('button[data-plan-wallet]').forEach(b => {
+    if (wallet && b.getAttribute('data-plan-wallet') !== wallet) return;
+    b.disabled = false;
+    if (b.dataset.origText) b.textContent = b.dataset.origText;
+    delete b.dataset.origText;
+  });
+}
+
+function openPlanningPanelFocus(planId) {
+  if (!isRugPullerMode || !planId) return;
+  const rugMain = document.getElementById('rugMain');
+  const planTabs = document.getElementById('planTabs');
+  if (rugMain && rugMain.style.display !== 'none') {
+    const panel = planTabs && planTabs.closest('.panel');
+    if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+  closedPlanTabIds.delete(planId);
+  activePlanId = planId;
+}
+
+function applyPlansFromServer(plans, focusPlanId) {
+  if (!Array.isArray(plans)) return;
+  if (focusPlanId) openPlanningPanelFocus(focusPlanId);
+  renderPlans(plans);
+  if (focusPlanId) selectPlan(focusPlanId);
+}
+
+let planConfirmWallet = null;
+
+function openPlanConfirmModal() {
+  const m = document.getElementById('planConfirmModal');
+  if (!m) return;
+  m.style.display = 'flex';
+  m.classList.remove('hidden');
+}
+
+function closePlanConfirmModal() {
+  const m = document.getElementById('planConfirmModal');
+  if (!m) return;
+  m.classList.add('hidden');
+  setTimeout(() => { m.style.display = 'none'; }, 200);
+  planConfirmWallet = null;
+}
+
+function planSuspectPrompt(btn) {
+  if (!btn) return;
+  const walletFull = btn.getAttribute('data-plan-wallet');
+  if (!walletFull) return;
+  planConfirmWallet = walletFull;
+  const fullEl = document.getElementById('planConfirmWalletFull');
+  if (fullEl) fullEl.textContent = walletFull;
+  openPlanConfirmModal();
+}
+
+function executePlanConfirm() {
+  const walletFull = planConfirmWallet;
+  closePlanConfirmModal();
+  if (!walletFull) return;
+  planSuspectSend(walletFull);
+}
+
+function planSuspectSend(walletFull) {
+  if (!walletFull) return;
+  document.querySelectorAll('button[data-plan-wallet]').forEach(b => {
+    if (b.getAttribute('data-plan-wallet') === walletFull) {
+      b.dataset.origText = b.dataset.origText || b.textContent;
+      b.textContent = 'Generating...';
+      b.disabled = true;
+    }
+  });
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'plan_suspect', wallet: walletFull, force: true }));
+  } else {
+    clearPlanButtonLoading(walletFull);
+    addLog({ time: ts(), msg: 'Not connected — cannot request plan', level: 'warn' });
+  }
+}
+
+function toggleStatsDropdown(ev) {
+  ev.stopPropagation();
+  const dd = document.getElementById('statsDropdown');
+  if (!dd) return;
+  dd.classList.toggle('hidden');
+  if (!dd.classList.contains('hidden')) syncMiniStatsChart();
+}
+
+function syncMiniStatsChart() {
+  const canvas = document.getElementById('statsMiniChart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  if (statsMiniChart) { statsMiniChart.destroy(); statsMiniChart = null; }
+  const labs = chartLabels.slice(-40);
+  const vals = chartVals.slice(-40);
+  statsMiniChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: labs, datasets: [{ data: vals, borderColor: '#00e676', borderWidth: 1.2, pointRadius: 0, tension: 0.35, fill: false }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { display: false },
+        y: { ticks: { color: '#5a6577', font: { size: 8, family: '\'JetBrains Mono\',monospace' } }, grid: { color: '#141820' } }
+      }
+    }
+  });
+}
+
+function collectRugSettingsPayload() {
+  const thr = document.getElementById('rugAutoPlanThr');
+  const agg = document.getElementById('rugAggression');
+  const age = document.getElementById('rugMinWalletAge');
+  const ap = document.getElementById('rugAutoApprove');
+  return {
+    auto_plan_threshold: thr ? parseFloat(thr.value, 10) : 70,
+    aggression_level: agg ? agg.value : 'standard',
+    min_wallet_age_minutes: age ? parseFloat(age.value, 10) : 0,
+    auto_approve: !!(ap && ap.checked)
+  };
+}
+
+function debouncedRugSettingsSend() {
+  clearTimeout(rugSettingsTimer);
+  rugSettingsTimer = setTimeout(sendRugSettingsNow, 320);
+}
+
+function sendRugSettingsNow() {
+  rugSettingsTimer = null;
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'update_rug_settings', data: collectRugSettingsPayload() }));
+}
+
+function syncRugSettingsFromServer(rs) {
+  if (!rs || typeof rs !== 'object') return;
+  const thr = document.getElementById('rugAutoPlanThr');
+  const agg = document.getElementById('rugAggression');
+  const age = document.getElementById('rugMinWalletAge');
+  const ap = document.getElementById('rugAutoApprove');
+  let t = Number(rs.auto_plan_threshold);
+  if (!Number.isFinite(t)) t = 70;
+  t = Math.max(0, Math.min(100, Math.round(t)));
+  if (thr) thr.value = String(t);
+  onRugPlanTriggerInput(String(t), false);
+  let m = Number(rs.min_wallet_age_minutes);
+  if (!Number.isFinite(m)) m = 0;
+  m = Math.max(0, Math.min(60, Math.round(m)));
+  if (age) age.value = String(m);
+  onRugMinWalletAgeInput(String(m), false);
+  const lvl = String(rs.aggression_level || 'standard').toLowerCase();
+  if (agg && ['conservative', 'standard', 'degenerate'].includes(lvl)) agg.value = lvl;
+  const aa = !!rs.auto_approve;
+  rugAutoApproveSessionOk = aa;
+  if (ap) ap.checked = aa;
+}
+
+function onRugPlanTriggerInput(v, doSend) {
+  const el = document.getElementById('rugTriggerPct');
+  const n = parseInt(v, 10);
+  if (el) el.textContent = 'Trigger: ' + (Number.isFinite(n) ? n : 0) + '%';
+  if (doSend !== false) debouncedRugSettingsSend();
+}
+
+function onRugMinWalletAgeInput(v, doSend) {
+  const el = document.getElementById('rugWalletAgeLbl');
+  const n = parseInt(v, 10);
+  if (el) el.textContent = 'Min age: ' + (Number.isFinite(n) ? n : 0) + ' min';
+  if (doSend !== false) debouncedRugSettingsSend();
+}
+
+function onRugAggressionChange() {
+  sendRugSettingsNow();
+}
+
+function onRugAutoApproveChange(chk) {
+  if (chk.checked && !rugAutoApproveSessionOk) {
+    chk.checked = false;
+    openRugAutoApproveModal();
+    return;
+  }
+  if (!chk.checked) rugAutoApproveSessionOk = false;
+  sendRugSettingsNow();
+}
+
+function openRugAutoApproveModal() {
+  const m = document.getElementById('rugAutoApproveModal');
+  if (!m) return;
+  m.style.display = 'flex';
+  m.classList.remove('hidden');
+}
+
+function closeRugAutoApproveModal() {
+  const m = document.getElementById('rugAutoApproveModal');
+  if (!m) return;
+  m.classList.add('hidden');
+  setTimeout(() => { m.style.display = 'none'; }, 200);
+}
+
+function confirmRugAutoApprove() {
+  closeRugAutoApproveModal();
+  rugAutoApproveSessionOk = true;
+  const chk = document.getElementById('rugAutoApprove');
+  if (chk) chk.checked = true;
+  sendRugSettingsNow();
+}
+
+function showDashToast(data) {
+  const msg = (data && data.message) || '';
+  const level = (data && data.level) || 'ok';
+  const ttl = (data && data.ttl_ms) || 2200;
+  const el = document.getElementById('dashToast');
+  if (!el || !msg) return;
+  const lv = level === 'warn' ? 'warn' : (level === 'error' || level === 'err' ? 'err' : 'ok');
+  el.textContent = msg;
+  el.className = 'dash-toast dash-toast--' + lv + ' visible';
+  clearTimeout(window._dashToastT);
+  window._dashToastT = setTimeout(() => { el.classList.remove('visible'); }, ttl);
+}
+
+function showRugSubtab(which) {
+  const dep = document.getElementById('rugPanelDeploy');
+  const wd = document.getElementById('rugPanelWalletDev');
+  const st = document.getElementById('rugPanelSettings');
+  const h = document.getElementById('rugSideHdr');
+  const tD = document.getElementById('rugSubDeploy');
+  const tW = document.getElementById('rugSubWalletDev');
+  const tS = document.getElementById('rugSubSettings');
+  if (!dep || !wd) return;
+  [tD, tW, tS].forEach(t => { if (t) t.classList.remove('active'); });
+  dep.style.display = 'none';
+  wd.style.display = 'none';
+  if (st) st.style.display = 'none';
+  if (which === 'deploy') {
+    if (tD) tD.classList.add('active');
+    dep.style.display = 'flex';
+    if (h) h.style.display = 'flex';
+  } else if (which === 'walletdev') {
+    if (tW) tW.classList.add('active');
+    wd.style.display = 'flex';
+    if (h) h.style.display = 'none';
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'get_wallet_dev' }));
+  } else if (which === 'settings') {
+    if (tS) tS.classList.add('active');
+    if (st) st.style.display = 'flex';
+    if (h) h.style.display = 'none';
+  }
+}
+
+function updateWalletDevPanel(data) {
+  const el = document.getElementById('walletDevBody');
+  if (!el || !data) return;
+  if (!data.enabled || !data.entries || data.entries.length === 0) {
+    el.innerHTML = '<div style="text-align:center;padding:16px;font-style:italic;color:var(--muted)">No active pool \u2014 Rug Puller (Live) with Helius key + wallet starts warming.</div>';
+    return;
+  }
+  el.innerHTML = data.entries.map(e => `
+    <div style="border:1px solid var(--bdr);border-radius:6px;padding:8px;margin-bottom:6px;background:#0a0c10">
+      <div style="display:flex;justify-content:space-between;margin-bottom:4px"><span style="color:var(--bright)">${esc(e.pubkey_short)}</span><span style="color:${e.status === 'ready' ? 'var(--green)' : 'var(--orange)'}">${esc(e.status)}</span></div>
+      <div style="font-size:9px;color:var(--muted)">Age ${Math.round(e.age_sec)}s / ${e.age_target_sec}s \u00b7 \u00b5-tx ${e.micro_tx_count}/${e.micro_tx_target} \u00b7 warm ${(e.warm_progress * 100).toFixed(0)}%</div>
+      ${e.last_error ? '<div style="color:var(--red);font-size:9px;margin-top:4px">' + esc(e.last_error) + '</div>' : ''}
+    </div>`).join('');
+}
+
+function updateRugStats(stats){
+  if(!stats)return;
+  const $=id=>{const e=document.getElementById(id);return e};
+  const s=id=>$('rp'+id);
+  if(s('Wallets'))s('Wallets').textContent=stats.wallets_tracked||0;
+  if(s('Scored'))s('Scored').textContent=stats.wallets_scored||0;
+  if(s('Suspected')){s('Suspected').textContent=stats.bots_suspected||0;s('Suspected').style.color=(stats.bots_suspected||0)>0?'var(--orange)':'var(--dim)'}
+  if(s('Confirmed')){s('Confirmed').textContent=stats.bots_confirmed||0;s('Confirmed').style.color=(stats.bots_confirmed||0)>0?'var(--red)':'var(--dim)'}
+  if(s('Events'))s('Events').textContent=stats.events_processed||0;
+  if(s('Eps'))s('Eps').textContent=(stats.events_per_sec||0).toFixed(1);
+  if(s('Tokens'))s('Tokens').textContent=stats.tokens_tracked||0;
+}
+
+// ---- WebSocket ----
+
+function connect(){
+  document.getElementById('statusLbl').textContent='CONNECTING';
+  const _h=location.hostname||'localhost';
+  const _ws=(location.protocol==='https:'?'wss':'ws')+'://'+_h+':8765';
+  ws=new WebSocket(_ws);
+  ws.onopen=()=>{setConn(true);addLog({time:ts(),msg:'Dashboard connected',level:'entry'});if(!modeConfirmed&&document.getElementById('step2').classList.contains('active')){triggerInitialValidation()}};
+  ws.onmessage=e=>{
+    try{
+      const ev=JSON.parse(e.data);
+      if(ev.type==='snapshot'){
+        if(ev.data.startup_hints) startupHints = ev.data.startup_hints;
+        updateStats(ev.data);
+        if(ev.data.config) syncSliders(ev.data.config);
+        if(ev.data.presets) updatePresetList(ev.data);
+        if(!modeConfirmed && document.getElementById('step2').classList.contains('active')){
+          refreshCfgEnvBanner(selectedMode);
+          triggerInitialValidation();
+        }
+        if(modeConfirmed){const mode=ev.data.mode||'PAPER';document.getElementById('modeLbl').textContent=mode;
+        document.getElementById('modeLbl').style.color=mode.includes('RUST')?'var(--cyan)':mode.includes('LIVE')?'var(--green)':'var(--dim)';}
+        if(ev.data.paused!==undefined) updatePauseUI(ev.data.paused);
+        if(ev.data.trade_history){
+          ev.data.trade_history.forEach(t=>{chartLabels.push(t.time);chartVals.push(t.cum_pnl);trades.push(t)});
+          if(pnlChart){pnlChart.data.labels=chartLabels;pnlChart.data.datasets[0].data=chartVals;pnlChart.update('none')}
+          renderTrades();
+        }
+        // Handle rug puller mode on reconnect
+        if(ev.data.is_rug_puller){
+          isRugPullerMode=true;
+          document.getElementById('sniperMain').style.display='none';
+          document.getElementById('rugMain').style.display='flex';
+          document.getElementById('sniperStats').style.display='none';
+          document.getElementById('rugStats').style.display='flex';
+          document.querySelector('.hdr').classList.add('rug-mode');
+          document.querySelector('.hdr-title').innerHTML='BIGAL <span>RUG PULLER</span>';
+          document.querySelector('.hdr-sub').textContent='PUMPFUN \u00b7 BOT DETECTION \u00b7 ML ENGINE';
+        }
+        if(ev.data.rug_settings){syncRugSettingsFromServer(ev.data.rug_settings)}
+        if(ev.data.bot_suspects){_throttledRenderBots(ev.data.bot_suspects)}
+        if(ev.data.profiler_stats){updateRugStats(ev.data.profiler_stats)}
+        if(ev.data.wallet_dev){updateWalletDevPanel(ev.data.wallet_dev)}
+        // Request orchestrator status for plan data
+        if(ev.data.is_rug_puller && ws && ws.readyState===1){
+          ws.send(JSON.stringify({type:'get_orchestrator_status'}));
+        }
+      } else if(ev.type==='stats'){
+        updateStats(ev.data);
+        if(ev.data.wallet_dev){updateWalletDevPanel(ev.data.wallet_dev)}
+        if(ev.data.paused!==undefined) updatePauseUI(ev.data.paused);
+      }
+      else if(ev.type==='trade'){addTrade(ev.data)}
+      else if(ev.type==='log'){addLog(ev.data)}
+      else if(ev.type==='config'){syncSliders(ev.data)}
+      else if(ev.type==='presets_update'){updatePresetList(ev.data)}
+      else if(ev.type==='mode_ack'){
+        const m=ev.data;
+        if(m.executor_type) lastExecutorType=m.executor_type;
+        document.getElementById('modeLbl').textContent=m.mode||'PAPER';
+        const modeStr=m.mode||'';
+        document.getElementById('modeLbl').style.color=modeStr.includes('RUG')?'var(--red)':modeStr.includes('RUST')?'var(--cyan)':modeStr.includes('LIVE')?'var(--green)':'var(--dim)';
+        if(typeof m.balance==='number'&&!Number.isNaN(m.balance)) document.getElementById('sBalance').innerHTML=`${m.balance.toFixed(4)}<span class="stat-u">SOL</span>`;
+
+        // Switch layouts based on mode
+        if(modeStr.includes('RUG')){
+          isRugPullerMode=true;
+          document.getElementById('sniperMain').style.display='none';
+          document.getElementById('rugMain').style.display='flex';
+          document.getElementById('sniperStats').style.display='none';
+          document.getElementById('rugStats').style.display='flex';
+          document.querySelector('.hdr').classList.add('rug-mode');
+          document.querySelector('.hdr-title').innerHTML='BIGAL <span>RUG PULLER</span>';
+          document.querySelector('.hdr-sub').textContent='PUMPFUN · BOT DETECTION · ML ENGINE';
+          // Request profiler data
+          if(ws&&ws.readyState===1){ws.send(JSON.stringify({type:'get_profiler_data'}))}
+        }else{
+          isRugPullerMode=false;
+          document.getElementById('sniperMain').style.display='flex';
+          document.getElementById('rugMain').style.display='none';
+          document.getElementById('sniperStats').style.display='flex';
+          document.getElementById('rugStats').style.display='none';
+          document.querySelector('.hdr').classList.remove('rug-mode');
+          document.querySelector('.hdr-title').innerHTML='BIGAL SNIPER <span>CUSTOM</span>';
+          document.querySelector('.hdr-sub').textContent='PUMPFUN · REAL-TIME TUNING';
+        }
+
+        dismissModal();
+        addLog({time:ts(),msg:'Mode: '+m.mode,level:'entry'});
+      }
+      else if(ev.type==='mode_error'){
+        const btn=document.getElementById('submitBtn');
+        if(btn){btn.disabled=false;btn.textContent='RETRY';}
+        addLog({time:ts(),msg:ev.data.error||'Mode selection failed',level:'warn'});
+      }
+      else if(ev.type==='validation_result'){
+        handleValidationResult(ev.data);
+      }
+      else if(ev.type==='bot_suspects'){
+        _throttledRenderBots(ev.data);
+      }
+      else if(ev.type==='profiler_stats'){
+        updateRugStats(ev.data);
+      }
+      else if(ev.type==='orchestrator_status'){
+        if(ev.data && ev.data.plans) renderPlans(ev.data.plans);
+      }
+      else if(ev.type==='plan_created'){
+        const d = ev.data || {};
+        const plist = Array.isArray(d.plans) && d.plans.length
+          ? d.plans
+          : (d.plan && d.plan.plan_id ? [d.plan] : []);
+        const focus = d.focus_plan_id || (d.plan && d.plan.plan_id) || null;
+        if (plist.length) applyPlansFromServer(plist, focus);
+      }
+      else if(ev.type==='mode_switch_ready'){
+        const sm=document.getElementById('modeSwitchModal');
+        if(sm){sm.classList.add('hidden');sm.style.display='none';}
+        const modal=document.getElementById('startupModal');
+        modal.style.display='flex';
+        modal.classList.remove('hidden');
+        modal.classList.remove('dimmed');
+        document.getElementById('step1').classList.add('active');
+        document.getElementById('step2').classList.remove('active');
+        modeConfirmed=false;
+        document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'));
+        addLog({time:ts(),msg:'Session stopped — select Sniper or Rug Puller mode',level:'warn'});
+      }
+      else if(ev.type==='plan_suspect_result'){
+        const d=ev.data||{};
+        clearPlanButtonLoading(d.wallet_requested);
+        addLog({time:ts(),msg:d.ok?(d.mock?'Plan ready (mock/heuristic)':'Plan generated'):('Plan failed: '+(d.error||'unknown')),level:d.ok?'entry':'warn'});
+        if (d.ok) showDashToast({ message: d.message === 'Plan already exists' ? 'Opened existing plan' : 'Plan ready — see tabs above', level: 'ok', ttl_ms: 2400 });
+      }
+      else if(ev.type==='wallet_dev'){
+        updateWalletDevPanel(ev.data);
+      }
+      else if(ev.type==='rug_settings_saved'){
+        syncRugSettingsFromServer(ev.data);
+      }
+      else if(ev.type==='toast'){
+        showDashToast(ev.data);
+      }
+      else if(ev.type==='pause_status'){
+        updatePauseUI(ev.data.paused);
+      }
+    }catch(err){console.error(err)}
+  };
+  ws.onclose=()=>{setConn(false);addLog({time:ts(),msg:'Reconnecting in 3s...',level:'warn'});reconnTimer=setTimeout(connect,3000)};
+  ws.onerror=()=>ws.close();
+}
+
+function ts(){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+
+window.addEventListener('DOMContentLoaded',()=>{
+  initChart();
+  buildSliders();
+  updateWinSoundToggleUI();
+  updateLossSoundToggleUI();
+  const rThr = document.getElementById('rugAutoPlanThr');
+  const rAge = document.getElementById('rugMinWalletAge');
+  if (rThr) onRugPlanTriggerInput(rThr.value, false);
+  if (rAge) onRugMinWalletAgeInput(rAge.value, false);
+  addLog({time:ts(),msg:'BigAl Customizable Dashboard initialized',level:'info'});
+  document.addEventListener('click',(e)=>{
+    if(e.target.closest('.stats-dd-wrap'))return;
+    const dd=document.getElementById('statsDropdown');
+    if(dd)dd.classList.add('hidden');
+  });
+  connect();
+});
+</script>
+</body>
+</html>
