@@ -9,6 +9,7 @@ use solana_sdk::{
     pubkey::Pubkey,
     transaction::Transaction,
 };
+use std::time::Duration;
 use tracing::debug;
 
 pub struct RpcClient {
@@ -18,9 +19,15 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn new(url: &str) -> Self {
+        let http = reqwest::Client::builder()
+            // Unbounded requests could stall the executor past Python's ZMQ wait.
+            .timeout(Duration::from_secs(45))
+            .connect_timeout(Duration::from_secs(12))
+            .build()
+            .expect("reqwest client build");
         RpcClient {
             url: url.to_string(),
-            http: reqwest::Client::new(),
+            http,
         }
     }
 

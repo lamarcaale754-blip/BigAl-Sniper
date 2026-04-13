@@ -70,11 +70,17 @@ impl JitoBundler {
             info!("JitoBundler initialized | url={} | tip_accounts={}", bundle_url, tip_accounts.len());
         }
 
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(12))
+            .connect_timeout(Duration::from_secs(8))
+            .build()
+            .expect("reqwest client build (Jito)");
+
         JitoBundler {
             bundle_url,
             secondary_bundle_url,
             tip_accounts,
-            http: reqwest::Client::new(),
+            http,
         }
     }
 
@@ -304,6 +310,66 @@ impl JitoBundler {
         rpc.send_transaction(tx).await
             .context("RPC send_and_confirm failed")
     }
+}
+
+/// Race Jito bundle submission against direct RPC; same signed tx → chain dedupes.
+///
+/// `jito_method` / `rpc_method` are returned to Python (e.g. `"jito"` vs `"rpc"`, or
+/// `"jito_kill"` / `"rpc_kill"` for kill chain).
+///
+/// Bounded by `BIGAL_LAND_TIMEOUT_SEC` (default 28). Uses `biased` polling so RPC is
+/// checked first when both complete — more `rpc` wins when timings are similar.
+pub async fn race_land_submit(
+    jito_fut: impl std::future::Future<Output = Result<String>> + Send,
+    rpc_fut: impl std::future::Future<Output = Result<String>> + Send,
+    jito_method: &'static str,
+    rpc_method: &'static str,
+) -> Result<(String, &'static str)> {
+    let secs: u64 = std::env::var("BIGAL_LAND_TIMEOUT_SEC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(28);
+    let land_deadline = Duration::from_secs(secs);
+
+    tokio::time::timeout(land_deadline, async {
+        tokio::pin!(jito_fut);
+        tokio::pin!(rpc_fut);
+
+        tokio::select! {
+            biased;
+            rpc_result = &mut rpc_fut => {
+                match rpc_result {
+                    Ok(sig) => Ok((sig, rpc_method)),
+                    Err(rpc_err) => {
+                        warn!("RPC lost race ({}), awaiting Jito...", rpc_err);
+                        match jito_fut.await {
+                            Ok(id) => Ok((id, jito_method)),
+                            Err(jito_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
+                        }
+                    }
+                }
+            }
+            jito_result = &mut jito_fut => {
+                match jito_result {
+                    Ok(id) => Ok((id, jito_method)),
+                    Err(jito_err) => {
+                        warn!("Jito lost race ({}), awaiting RPC...", jito_err);
+                        match rpc_fut.await {
+                            Ok(sig) => Ok((sig, rpc_method)),
+                            Err(rpc_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Jito+RPC land timed out after {}s (raise BIGAL_LAND_TIMEOUT_SEC or ZMQ_SELL_WAIT_SEC if needed)",
+            secs
+        )
+    })?
 }
 
 // ─────────────────────────────────────────────

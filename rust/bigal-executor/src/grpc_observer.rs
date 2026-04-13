@@ -1,65 +1,187 @@
-/// Yellowstone gRPC Observer — The "Geyser Eye"
-///
-/// Connects to a Yellowstone gRPC endpoint and subscribes to Pump.fun
-/// program transactions at the "Processed" commitment level.
-///
-/// This sees transactions as validators are streaming shreds — before
-/// they appear in the public WebSocket feeds, giving ~200-500ms advantage.
-///
-/// Parsed events are forwarded to Python via a dedicated ZMQ PUB socket (port 5557).
-///
-/// Compile with `--features grpc` to enable this module.
+//! Yellowstone Geyser gRPC → ZMQ bridge, aligned with BigAl + [rpcpool/yellowstone-grpc](https://github.com/rpcpool/yellowstone-grpc).
+//!
+//! - **Env**: `GRPC_ENDPOINT`, `GRPC_X_TOKEN` (same as dashboard / Helius Geyser).
+//! - **Out**: JSON on `ZMQ_YELLOWSTONE_IPC` matching `sidecar/sidecar_grpc.js` so Python `grpc_zmq_listener` works unchanged.
+//! - **Build**: `cargo build --release --features grpc` (Linux server recommended).
+//! - **TLS / ping**: HTTPS endpoints use native roots; server `Ping` updates are answered per Triton docs (load balancers).
 
-use serde::Serialize;
-use tracing::warn;
 use zeromq::PubSocket;
 
-/// A parsed gRPC transaction event forwarded to Python
-#[derive(Debug, Serialize)]
-pub struct GrpcEvent {
-    pub event_type: String,     // "new_token", "buy", "sell", "transaction"
-    pub signature: String,      // transaction signature
-    pub mint: Option<String>,   // token mint address
-    pub trader: Option<String>, // wallet that initiated
-    pub sol_amount: Option<f64>,
-    pub slot: u64,
-    pub timestamp_ms: u64,
-}
-
-/// Start the gRPC observer stream.
-///
-/// This function requires the `grpc` feature flag to be enabled.
-/// Without it, this is a no-op stub.
 #[cfg(feature = "grpc")]
-pub async fn start_grpc_observer(
-    endpoint: &str,
-    x_token: &str,
-    program_id: &str,
-    watch_wallets: Vec<String>,
-    zmq_pub: std::sync::Arc<tokio::sync::Mutex<PubSocket>>,
-) -> anyhow::Result<()> {
-    use futures::StreamExt;
-    use std::collections::HashMap;
-    use yellowstone_grpc_client::GeyserGrpcClient;
-    use yellowstone_grpc_proto::prelude::*;
-    use zeromq::{SocketSend, ZmqMessage};
+use {
+    futures::{SinkExt, StreamExt},
+    solana_sdk::pubkey::Pubkey,
+    std::collections::HashMap,
+    std::str::FromStr,
+    std::time::Duration,
+    tonic::transport::ClientTlsConfig,
+    tracing::{debug, error, info, warn},
+    yellowstone_grpc_client::GeyserGrpcClient,
+    yellowstone_grpc_proto::prelude::{
+        subscribe_update::UpdateOneof, CommitmentLevel, CompiledInstruction, Message,
+        SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing,
+        SubscribeUpdateTransaction, TransactionStatusMeta,
+    },
+    zeromq::{SocketSend, ZmqMessage},
+};
 
-    info!("Connecting to Yellowstone gRPC: {}", endpoint);
+#[cfg(feature = "grpc")]
+const DISC_CREATE: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
+#[cfg(feature = "grpc")]
+const DISC_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+#[cfg(feature = "grpc")]
+const DISC_SELL: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 
-    let mut client = GeyserGrpcClient::build_from_shared(endpoint)?
+/// Connect to Geyser with the same builder pattern as Yellowstone upstream examples.
+#[cfg(feature = "grpc")]
+async fn connect_geyser(endpoint: &str, x_token: &str) -> anyhow::Result<yellowstone_grpc_client::GeyserGrpcClient<impl tonic::service::Interceptor>> {
+    let mut builder = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
         .x_token(Some(x_token.to_string()))?
-        .connect()
-        .await?;
+        .connect_timeout(Duration::from_secs(20))
+        .tcp_nodelay(true)
+        .http2_keep_alive_interval(Duration::from_secs(15))
+        .keep_alive_while_idle(true)
+        .max_decoding_message_size(256 * 1024 * 1024);
 
-    // Build subscription request
-    let mut transactions = HashMap::new();
-    let mut account_include = vec![program_id.to_string()];
-    for wallet in &watch_wallets {
-        account_include.push(wallet.clone());
+    if endpoint.starts_with("https://") {
+        builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?;
     }
 
+    Ok(builder.connect().await?)
+}
+
+#[cfg(feature = "grpc")]
+fn account_keys_for_message(msg: &Message, meta: Option<&TransactionStatusMeta>) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = msg.account_keys.clone();
+    if msg.versioned {
+        if let Some(m) = meta {
+            keys.extend(m.loaded_writable_addresses.iter().cloned());
+            keys.extend(m.loaded_readonly_addresses.iter().cloned());
+        }
+    }
+    keys
+}
+
+#[cfg(feature = "grpc")]
+fn key_b58(keys: &[Vec<u8>], idx: usize) -> Option<String> {
+    keys.get(idx).map(|b| bs58::encode(b).into_string())
+}
+
+#[cfg(feature = "grpc")]
+fn ix_idx(ix: &CompiledInstruction, pos: usize) -> Option<usize> {
+    ix.accounts.get(pos).map(|b| *b as usize)
+}
+
+/// Map Yellowstone tx + meta → same JSON keys as `sidecar_grpc.js` / Python handlers.
+#[cfg(feature = "grpc")]
+fn pump_event_sidecar_shape(
+    pump_program: &Pubkey,
+    slot: u64,
+    update: &SubscribeUpdateTransaction,
+) -> Option<serde_json::Value> {
+    let info = update.transaction.as_ref()?;
+    let inner = info.transaction.as_ref()?;
+    let msg = inner.message.as_ref()?;
+    let meta = info.meta.as_ref();
+
+    let keys = account_keys_for_message(msg, meta);
+    let pump_bytes = pump_program.to_bytes();
+
+    for ix in &msg.instructions {
+        let pidx = ix.program_id_index as usize;
+        let prog = keys.get(pidx)?;
+        if prog.len() != 32 || prog.as_slice() != pump_bytes.as_slice() {
+            continue;
+        }
+        let data = &ix.data;
+        if data.len() < 8 {
+            continue;
+        }
+        let disc: [u8; 8] = data[0..8].try_into().ok()?;
+
+        let tx_type = if disc == DISC_CREATE {
+            "create"
+        } else if disc == DISC_BUY {
+            "buy"
+        } else if disc == DISC_SELL {
+            "sell"
+        } else {
+            continue;
+        };
+
+        let (mint, trader) = if tx_type == "create" {
+            let mint = key_b58(&keys, ix_idx(ix, 0)?)?;
+            let trader = key_b58(&keys, ix_idx(ix, 7)?)?;
+            (mint, trader)
+        } else {
+            let mint = key_b58(&keys, ix_idx(ix, 2)?)?;
+            let trader = key_b58(&keys, ix_idx(ix, 6)?)?;
+            (mint, trader)
+        };
+
+        let mut sol_amount = 0.0_f64;
+        let mut v_sol_bc = 0.0_f64;
+        if let Some(m) = meta {
+            if let Some(ti) = keys.iter().position(|k| k.len() == 32 && bs58::encode(k).into_string() == trader) {
+                if ti < m.pre_balances.len() && ti < m.post_balances.len() {
+                    let d = m.post_balances[ti] as i128 - m.pre_balances[ti] as i128;
+                    sol_amount = (d.unsigned_abs() as f64) / 1e9;
+                }
+            }
+            if let Some(bc_i) = if tx_type == "create" {
+                ix_idx(ix, 2)
+            } else {
+                ix_idx(ix, 3)
+            } {
+                if bc_i < m.post_balances.len() {
+                    v_sol_bc = m.post_balances[bc_i] as f64 / 1e9;
+                }
+            }
+        }
+
+        let mut v_tokens = 0.0_f64;
+        if let (Some(m), Some(mint_ref)) = (meta, Some(mint.as_str())) {
+            for tb in &m.post_token_balances {
+                if tb.mint == mint_ref {
+                    if let Some(s) = tb.ui_token_amount.as_ref().and_then(|u| u.ui_amount_string.parse::<f64>().ok()) {
+                        if s > v_tokens {
+                            v_tokens = s;
+                        }
+                    }
+                }
+            }
+        }
+
+        return Some(serde_json::json!({
+            "txType": tx_type,
+            "mint": mint,
+            "traderPublicKey": trader,
+            "solAmount": sol_amount,
+            "vSolInBondingCurve": v_sol_bc,
+            "vTokensInBondingCurve": v_tokens,
+            "slot": slot,
+            "_source": "yellowstone",
+        }));
+    }
+    None
+}
+
+#[cfg(feature = "grpc")]
+fn subscribe_request(
+    program_id: &str,
+    watch_wallets: &[String],
+) -> anyhow::Result<SubscribeRequest> {
+    let pump = Pubkey::from_str(program_id)?;
+    let mut account_include = vec![program_id.to_string()];
+    for w in watch_wallets {
+        if !w.is_empty() && !account_include.iter().any(|x| x == w) {
+            account_include.push(w.clone());
+        }
+    }
+
+    let mut transactions = HashMap::new();
     transactions.insert(
-        "pump_fun_txs".to_string(),
+        "bigal_pump".to_string(),
         SubscribeRequestFilterTransactions {
             vote: Some(false),
             failed: Some(false),
@@ -68,84 +190,75 @@ pub async fn start_grpc_observer(
         },
     );
 
-    let request = SubscribeRequest {
+    Ok(SubscribeRequest {
         transactions,
         commitment: Some(CommitmentLevel::Processed as i32),
         ..Default::default()
-    };
+    })
+}
 
+/// Run Yellowstone stream; forwards sidecar-compatible JSON to ZMQ PUB.
+#[cfg(feature = "grpc")]
+pub async fn start_grpc_observer(
+    endpoint: &str,
+    x_token: &str,
+    program_id: &str,
+    watch_wallets: Vec<String>,
+    zmq_pub: std::sync::Arc<tokio::sync::Mutex<PubSocket>>,
+) -> anyhow::Result<()> {
+    let pump_pk = Pubkey::from_str(program_id)?;
+    let mut client = connect_geyser(endpoint, x_token).await?;
+
+    let request = subscribe_request(program_id, &watch_wallets)?;
     info!(
-        "gRPC subscription active | program={} | watching {} wallets",
+        "Yellowstone subscribe | endpoint={} | program={} | extra_wallets={}",
+        endpoint,
         program_id,
         watch_wallets.len()
     );
 
-    let (_, mut stream) = client.subscribe_with_request(Some(request)).await?;
+    let (mut sink, mut stream) = client.subscribe_with_request(Some(request)).await?;
 
     while let Some(message) = stream.next().await {
         match message {
             Ok(msg) => {
-                if let Some(update) = msg.update_oneof {
-                    if let subscribe_update::UpdateOneof::Transaction(tx_info) = update {
-                        let slot = tx_info.slot;
-                        if let Some(event) = extract_grpc_event(&tx_info, slot) {
-                            let json = serde_json::to_string(&event).unwrap_or_default();
-                            let mut sock = zmq_pub.lock().await;
-                            if let Err(e) = sock.send(ZmqMessage::from(json)).await {
-                                debug!("gRPC->ZMQ send failed: {}", e);
+                if let Some(oneof) = msg.update_oneof {
+                    match oneof {
+                        UpdateOneof::Ping(_) => {
+                            let keepalive = SubscribeRequest {
+                                ping: Some(SubscribeRequestPing { id: 0 }),
+                                ..Default::default()
+                            };
+                            if let Err(e) = sink.send(keepalive).await {
+                                debug!("Yellowstone ping reply send failed: {}", e);
                             }
                         }
+                        UpdateOneof::Transaction(tx) => {
+                            let slot = tx.slot;
+                            if let Some(json) = pump_event_sidecar_shape(&pump_pk, slot, &tx) {
+                                let line = json.to_string();
+                                let mut sock = zmq_pub.lock().await;
+                                if let Err(e) = sock.send(ZmqMessage::from(line)).await {
+                                    debug!("Yellowstone ZMQ send failed: {}", e);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
             Err(e) => {
-                error!("gRPC stream error: {}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                error!("Yellowstone stream error: {}", e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }
 
-    warn!("gRPC stream ended — reconnecting...");
+    warn!("Yellowstone stream ended");
     Ok(())
 }
 
-/// Extract a GrpcEvent from a raw gRPC transaction update.
-#[cfg(feature = "grpc")]
-fn extract_grpc_event(
-    tx_info: &yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction,
-    slot: u64,
-) -> Option<GrpcEvent> {
-    let tx_detail = tx_info.transaction.as_ref()?;
-    let inner_tx = tx_detail.transaction.as_ref()?;
-
-    if inner_tx.signatures.is_empty() {
-        return None;
-    }
-
-    let sig = bs58::encode(&inner_tx.signatures[0]).into_string();
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let trader = inner_tx
-        .message
-        .as_ref()
-        .and_then(|msg| msg.account_keys.first().map(|k| bs58::encode(k).into_string()));
-
-    Some(GrpcEvent {
-        event_type: "transaction".to_string(),
-        signature: sig,
-        mint: None,
-        trader,
-        sol_amount: None,
-        slot,
-        timestamp_ms: now_ms,
-    })
-}
-
-/// Stub implementation when gRPC feature is not enabled
+/// Without `--features grpc`, Yellowstone is unavailable — caller should not spawn a busy loop.
 #[cfg(not(feature = "grpc"))]
 pub async fn start_grpc_observer(
     _endpoint: &str,
@@ -154,9 +267,7 @@ pub async fn start_grpc_observer(
     _watch_wallets: Vec<String>,
     _zmq_pub: std::sync::Arc<tokio::sync::Mutex<PubSocket>>,
 ) -> anyhow::Result<()> {
-    warn!("gRPC observer not available — compile with `--features grpc` to enable");
-    warn!("Falling back to WebSocket-based observation (higher latency)");
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-    }
+    anyhow::bail!(
+        "bigal-executor was built without Yellowstone; rebuild with: cargo build --release --features grpc"
+    );
 }
