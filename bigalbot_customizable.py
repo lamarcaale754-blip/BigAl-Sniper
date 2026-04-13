@@ -12,12 +12,14 @@ import json
 import time
 import csv
 import os
+import base64
 import sys
 import subprocess
 import signal
 import shutil
 import webbrowser
 import threading
+from collections import deque
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Set
@@ -38,8 +40,21 @@ from executor import (ExecutorBackend, PaperExecutor, LegacyExecutor, ZmqExecuto
                       resolved_buy, resolved_sell)
 from strategy_mode import StrategyMode, AdaptiveState, resolve_parameters
 from wallet_profiler import WalletProfiler
+from profiler_db import init_profiler_db, profitable_bots_in_buyers
 from rug_orchestrator import RugOrchestrator
 from wallet_developer import WalletDeveloper
+from hft_features import (
+    HoneypotGuard,
+    EntryIntelligence,
+    BlockhashCache,
+    AnalyticsEngine,
+    MLExitPredictor,
+    GhostSeller,
+    CounterIntel,
+    DynamicHold,
+    VolumeExitSignal,
+    InsiderTracker,
+)
 
 # Directory where this script lives (for resolving relative paths)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,7 +65,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # =====================================================
 
 class ProcessManager:
-    """Manages Rust executor and Node.js gRPC sidecar as child processes."""
+    """Manages Rust executor and Node.js WSS sidecar as child processes."""
 
     def __init__(self):
         self.rust_proc: Optional[subprocess.Popen] = None
@@ -108,6 +123,8 @@ class ProcessManager:
             # Match Python ZmqBridge IPC under /tmp/ (Rust executor reads these on Unix)
             env.setdefault("ZMQ_SIGNAL_IPC", ZMQ_SIGNAL_IPC)
             env.setdefault("ZMQ_RESULT_IPC", ZMQ_RESULT_IPC)
+        # Keep dual-path delivery enabled (Helius RPC + Jito racing in Rust).
+        env.setdefault("BIGAL_SELL_RPC_ONLY", "0")
         self.rust_proc = subprocess.Popen(
             [binary],
             env=env,
@@ -116,35 +133,35 @@ class ProcessManager:
             cwd=os.path.join(SCRIPT_DIR, "rust", "bigal-executor"),
         )
 
-        # Pin Rust executor: logical core 3 on a 4-core box (AWS us-east-1 c6g.xlarge pattern)
+        # m7i-flex.large target: keep Rust on core 1 (execution lane).
         cpus = self._available_cpus()
-        if len(cpus) >= 4:
-            self._pin_to_cpu(self.rust_proc, cpus[3])
+        if len(cpus) >= 2:
+            self._pin_to_cpu(self.rust_proc, cpus[1])
 
         return "ok"
 
     def is_rust_alive(self) -> bool:
         return self.rust_proc is not None and self.rust_proc.poll() is None
 
-    # ── Node.js gRPC sidecar ──────────────────────────
+    # ── Node.js Gatekeeper WSS sidecar ──────────────────────────
 
     def find_node(self) -> Optional[str]:
         """Check if node is available on PATH."""
         return shutil.which("node")
 
     def start_sidecar(self, helius_api_key: str) -> str:
-        """Spawn the Node.js gRPC sidecar. Returns status message."""
+        """Spawn the Node.js WSS sidecar. Returns status message."""
         if self.sidecar_proc and self.sidecar_proc.poll() is None:
             return "Sidecar already running"
 
         sidecar_dir = os.path.join(SCRIPT_DIR, "sidecar")
-        script_path = os.path.join(sidecar_dir, "sidecar_grpc.js")
+        script_path = os.path.join(sidecar_dir, "sidecar_wss.js")
         if not os.path.isfile(script_path):
-            return "Sidecar script not found at sidecar/sidecar_grpc.js"
+            return "Sidecar script not found at sidecar/sidecar_wss.js"
 
         node_bin = self.find_node()
         if not node_bin:
-            return "node not found on PATH — install Node.js to enable gRPC sidecar"
+            return "node not found on PATH — install Node.js to enable WSS sidecar"
 
         modules_dir = os.path.join(sidecar_dir, "node_modules")
         if not os.path.isdir(modules_dir):
@@ -163,22 +180,22 @@ class ProcessManager:
             cwd=sidecar_dir,
         )
 
-        # Pin sidecar to core 1 — reserve core 2 for Python main, core 3 for Rust
+        # m7i-flex.large target: keep discovery sidecar on core 0.
         cpus = self._available_cpus()
-        if len(cpus) >= 4:
-            self._pin_to_cpu(self.sidecar_proc, cpus[1])
+        if len(cpus) >= 2:
+            self._pin_to_cpu(self.sidecar_proc, cpus[0])
 
         return "ok"
 
     def pin_python_main(self):
-        """Pin the strategy process to core 2 on 4+ core Linux (pairs with Rust on core 3)."""
+        """Pin Python strategy process to core 1 on 2+ core Linux."""
         if sys.platform != "linux":
             return
         cpus = self._available_cpus()
-        if len(cpus) >= 4:
+        if len(cpus) >= 2:
             try:
-                os.sched_setaffinity(0, {cpus[2]})
-                print(f"📌 Python main pinned to CPU {cpus[2]}")
+                os.sched_setaffinity(0, {cpus[1]})
+                print(f"📌 Python main pinned to CPU {cpus[1]}")
             except (OSError, AttributeError):
                 pass
 
@@ -280,10 +297,10 @@ CONFIG = {
     # Risk
     "max_positions": 10, "trade_size": 0.05,
     # Rust executor sell min-out (percent). Wider = fewer reverts on fast dumps; max 35.
-    "rust_sell_slippage_pct": 18,
+    "rust_sell_slippage_pct": 25,
     "cooldown_losses": 8, "cooldown_sec": 10.0,
     # Moonbag
-    "moonbag_pct": 10.0, "moonbag_expire": 120.0,
+    "moonbag_pct": 0.0, "moonbag_expire": 120.0,
     "moonbag_sl": 15.0,       # hard SL for moonbags (% below creation price)
     "moonbag_trail": 20.0,    # trail from moonbag peak (% drop from peak sells)
     # Timing
@@ -293,6 +310,10 @@ CONFIG = {
     # Velocity check
     "velocity_check": 1,      # 1=on, 0=off — instant sell on sudden price crash
     "velocity_drop": 6.0,     # max allowed % drop in a single tick before instant sell
+    # Creator-wallet panic guard: force emergency exit on suspicious creator sell prints.
+    "dev_dump_panic_enabled": True,
+    "dev_dump_min_sol": 0.8,
+    "dev_dump_min_pct_position": 20.0,
     # Anti-manipulation
     "anti_manip": 1,          # 1=on, 0=off — detect fake volume patterns
     "min_wallet_diversity": 0.5,  # min ratio of unique buyer SOL amounts (0-1)
@@ -300,12 +321,44 @@ CONFIG = {
     "random_skip_pct": 10,    # randomly skip X% of qualifying entries (unpredictability)
     # Strategy mode (independent of trading mode)
     "strategy_mode": "manual",       # "manual" | "adaptive" | "hybrid"
-    "manual_tip": 0.002,             # manual priority fee (SOL)
+    "manual_tip": 0.0006,            # manual priority fee (SOL), tuned for small-wallet viability
+    "max_tip_sol": 0.00018,          # hard cap for normal live tips
+    "tip_pct_of_notional": 0.0024,   # cap tip to 0.24% of trade notional
+    "single_exit_under_sol": 0.08,   # for small positions, skip TP1 to avoid extra fee round-trip
+    "min_live_exit_sol": 0.0100,     # never spend tx fee to recover tiny dust-value exits
+    "min_live_tp1_exit_sol": 0.0200, # require meaningful notional for TP1 partial exits
+    "force_skip_micro_sells": True,  # apply dust-exit floor even on SL/velocity/stale paths
+    "force_full_exit": True,         # disable TP1/moonbag and always sell 100% on exit
+    "external_close_grace_sec": 25.0,   # avoid false "external close" immediately after buy
+    "buy_block_after_6000_sec": 180.0,  # cooldown mint after auth/account buy rejection
+    "auto_pause_fail_window_sec": 120.0,
+    "auto_pause_max_buy_failures": 4,
+    "auto_pause_max_sell_failures": 5,
+    "auto_pause_wallet_pnl_floor": -0.08,  # auto-pause if wallet delta drops below this
+    "emergency_tip_enabled": True,
+    "emergency_tip_floor_sol": 0.0010,     # panic exit floor tip (RUG/SL/velocity/deep drawdown)
+    "emergency_tip_pnl_pct": -15.0,        # trigger emergency tip at or below this pnl
+    "dust_sweep_enabled": True,            # after successful full exit, try one tiny sweep
+    "dust_sweep_max_units": 20,            # only sweep if raw token remainder is tiny
+    "jupiter_fallback_enabled": True,      # fallback sell path when direct Pump.fun sell fails
+    "jupiter_slippage_bps": 1800,          # 18% fallback slippage for volatile exits
+    "jupiter_min_output_sol": 0.0010,      # don't execute Jupiter fallback below this expected SOL
     "manual_min_liquidity": 0.3,     # manual min pool vSOL
     "manual_entry_progress": 0.5,    # manual min BC progress %
     "override_tip": False,           # hybrid: use manual tip instead of adaptive
     "override_liquidity": False,     # hybrid: use manual min_liquidity instead of adaptive
     "override_entry": False,         # hybrid: use manual entry_progress instead of adaptive
+    # 2026 HFT feature toggles
+    "honeypot_guard_enabled": True,
+    "entry_intel_enabled": True,
+    "entry_intel_min_score": -20.0,
+    "blockhash_prefetch_enabled": True,
+    "ghost_sell_enabled": False,
+    "counter_intel_enabled": True,
+    "ml_exit_enabled": True,
+    "dynamic_hold_enabled": True,
+    "insider_tracking_enabled": True,
+    "volume_exit_enabled": True,
 }
 
 PRESETS = {
@@ -451,7 +504,7 @@ MAX_SYMBOL_LENGTH = 10
 PUMPPORTAL_TRADE_LOCAL = "https://pumpportal.fun/api/trade-local"
 # Buys: tight min-out is fine (you control size). Sells: curve moves during the hold — 3% sell
 # slippage caused mass Rust sell reverts + Legacy fallback (15% there masked the issue).
-PUMP_SLIPPAGE_PCT_BY_MODE = {"zmq_rust": 3, "legacy": 15, "paper": 10}
+PUMP_SLIPPAGE_PCT_BY_MODE = {"zmq_rust": 15, "legacy": 15, "paper": 10}
 
 def _effective_slippage() -> int:
     """Return slippage % for BUYS in the current executor mode."""
@@ -510,6 +563,7 @@ class Position:
     last_update_time: float = 0.0
     prev_price: float = 0.0  # previous tick price for velocity check
     closing: bool = False  # guard against double-close race
+    custom_max_hold: float = 0.0
 
     def __post_init__(self):
         if self.remaining_size_sol == 0.0:
@@ -592,6 +646,17 @@ profiler: Optional[WalletProfiler] = None
 orchestrator: Optional[RugOrchestrator] = None
 wallet_dev: Optional[WalletDeveloper] = None
 wallet_dev_task: Optional[asyncio.Task] = None
+honey_guard: Optional[HoneypotGuard] = None
+entry_intel: Optional[EntryIntelligence] = None
+blockhash_cache: Optional[BlockhashCache] = None
+analytics_engine: Optional[AnalyticsEngine] = None
+ml_predictor: Optional[MLExitPredictor] = None
+ghost_seller: Optional[GhostSeller] = None
+counter_intel: Optional[CounterIntel] = None
+dynamic_hold: Optional[DynamicHold] = None
+volume_signal: Optional[VolumeExitSignal] = None
+insider_tracker: Optional[InsiderTracker] = None
+_entry_signal_wallet_by_mint: Dict[str, str] = {}
 execution_counters: Dict[str, int] = {
     "skip_cooldown": 0,
     "skip_paused": 0,
@@ -608,6 +673,9 @@ execution_counters: Dict[str, int] = {
     "buy_failed_chain": 0,
     "sell_failed_chain": 0,
 }
+_blocked_buy_mints_until: Dict[str, float] = {}
+_recent_buy_fail_ts = deque(maxlen=200)
+_recent_sell_fail_ts = deque(maxlen=200)
 
 # Rug Puller session settings (dashboard "Rug Puller Settings")
 RUG_SETTINGS: Dict[str, object] = {
@@ -786,11 +854,13 @@ async def manual_sell_position(mint):
 
     sell_ok = True
     if MODE_LIVE:
-        sell_ok = await live_sell_pump(mint)
+        sell_ok = await live_sell_pump(mint, "100%", "Manual", pnl_pct)
         if not sell_ok:
             async with state_lock:
                 if mint in source:
                     source[mint].closing = False
+            if await _maybe_log_sell_cooldown(mint, pos.name, pos.symbol, "Manual"):
+                return
             _bump_counter("sell_failed_chain")
             msg = f"⚠ Manual sell failed on-chain for {pos.name} ({pos.symbol}); position kept open"
             print(msg)
@@ -828,6 +898,8 @@ async def manual_sell_position(mint):
         wsnap = await wallet_chain_snapshot(force_rpc=True)
         trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
     await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
+    if MODE_LIVE:
+        await _post_exit_dust_sweep(mint, "Manual", pnl_pct)
     source.pop(mint, None)
     print(f"✅ Closed {pos.name} | Bal: {paper_balance:.4f} | W/L: {wins}/{losses}")
     await broadcast_log(f"✅ Manual closed {pos.name} | Bal: {paper_balance:.4f}", level)
@@ -1178,7 +1250,7 @@ async def _handle_mode_select_impl(msg, websocket):
                     new_executor_mode = "zmq_rust"
                     print("⚡ Rug Puller (LIVE) with Rust executor ready")
 
-                    # Auto-spawn gRPC sidecar for low-latency event streaming
+                    # Auto-spawn WSS sidecar for low-latency event streaming
                     sidecar_helius_rp = (
                         rpc_key.strip() if rpc_key
                         else (os.environ.get("HELIUS_API_KEY", "") or "").strip()
@@ -1187,9 +1259,9 @@ async def _handle_mode_select_impl(msg, websocket):
                     if sidecar_helius_rp and "YOUR_API_KEY_HERE" not in (HELIUS_RPC_URL or ""):
                         sidecar_status = proc_mgr.start_sidecar(sidecar_helius_rp)
                         if sidecar_status == "ok":
-                            print("✅ gRPC sidecar auto-started for rug puller")
+                            print("✅ WSS sidecar auto-started for rug puller")
                         else:
-                            print(f"⚠ gRPC sidecar skipped: {sidecar_status}")
+                            print(f"⚠ WSS sidecar skipped: {sidecar_status}")
                 else:
                     _probe.close()
                     new_executor = legacy
@@ -1326,7 +1398,7 @@ async def _handle_mode_select_impl(msg, websocket):
                              "message": "Rust executor running"}
                 }, target=websocket)
 
-                # ── Auto-spawn gRPC sidecar (non-critical) — key from dashboard, HELIUS_API_KEY, or RPC URL
+                # ── Auto-spawn WSS sidecar (non-critical) — key from dashboard, HELIUS_API_KEY, or RPC URL
                 sidecar_helius = (
                     rpc_key.strip()
                     if rpc_key
@@ -1336,14 +1408,14 @@ async def _handle_mode_select_impl(msg, websocket):
                 if sidecar_helius and "YOUR_API_KEY_HERE" not in (HELIUS_RPC_URL or ""):
                     sidecar_status = proc_mgr.start_sidecar(sidecar_helius)
                     if sidecar_status == "ok":
-                        print("✅ gRPC sidecar auto-started")
+                        print("✅ WSS sidecar auto-started")
                         await send_to_dashboard({
                             "type": "validation_result",
                             "data": {"field": "sidecar", "status": "ok",
-                                     "message": "gRPC sidecar running"}
+                                     "message": "WSS sidecar running"}
                         }, target=websocket)
                     else:
-                        print(f"⚠ gRPC sidecar skipped: {sidecar_status}")
+                        print(f"⚠ WSS sidecar skipped: {sidecar_status}")
                         await send_to_dashboard({
                             "type": "validation_result",
                             "data": {"field": "sidecar", "status": "warn",
@@ -1695,6 +1767,50 @@ def _actual_wallet_pnl_from_snapshot(wsnap: dict) -> Optional[float]:
 
 def _bump_counter(key: str) -> None:
     execution_counters[key] = execution_counters.get(key, 0) + 1
+    now = time.time()
+    if key == "buy_failed_chain":
+        _recent_buy_fail_ts.append(now)
+    elif key == "sell_failed_chain":
+        _recent_sell_fail_ts.append(now)
+
+
+async def _maybe_trip_safety_pause() -> None:
+    global TRADING_PAUSED, cooldown_until
+    if TRADING_PAUSED or not MODE_LIVE:
+        return
+    now = time.time()
+    window = max(10.0, float(CONFIG.get("auto_pause_fail_window_sec", 120.0) or 120.0))
+    while _recent_buy_fail_ts and (now - _recent_buy_fail_ts[0]) > window:
+        _recent_buy_fail_ts.popleft()
+    while _recent_sell_fail_ts and (now - _recent_sell_fail_ts[0]) > window:
+        _recent_sell_fail_ts.popleft()
+    buy_cap = int(CONFIG.get("auto_pause_max_buy_failures", 4) or 4)
+    sell_cap = int(CONFIG.get("auto_pause_max_sell_failures", 5) or 5)
+
+    hit_fail_storm = len(_recent_buy_fail_ts) >= buy_cap or len(_recent_sell_fail_ts) >= sell_cap
+    hit_wallet_floor = False
+    wsnap = await wallet_chain_snapshot()
+    wallet_delta = wsnap.get("wallet_delta_sol")
+    if wallet_delta is not None:
+        floor = float(CONFIG.get("auto_pause_wallet_pnl_floor", -0.08) or -0.08)
+        hit_wallet_floor = wallet_delta <= floor
+
+    if not (hit_fail_storm or hit_wallet_floor):
+        return
+
+    TRADING_PAUSED = True
+    cooldown_until = now + max(30.0, float(CONFIG.get("cooldown_sec", 10.0) or 10.0))
+    reason = []
+    if hit_fail_storm:
+        reason.append(
+            f"fail storm (buy_fails={len(_recent_buy_fail_ts)}, sell_fails={len(_recent_sell_fail_ts)})"
+        )
+    if hit_wallet_floor:
+        reason.append(f"wallet_pnl_floor ({wallet_delta:+.4f} SOL)")
+    msg = f"🛑 Safety auto-pause triggered: {', '.join(reason)}"
+    print(msg)
+    await broadcast_log(msg, "warn")
+    await send_to_dashboard({"type": "pause_status", "data": {"paused": True}})
 
 
 async def wallet_chain_snapshot(force_rpc: bool = False) -> dict:
@@ -1763,6 +1879,12 @@ async def broadcast_stats():
             "profiler_stats": profiler.get_profiler_stats() if profiler else None,
             "wallet_dev": _wallet_dev_snapshot(),
             "execution_counters": dict(execution_counters),
+            "analytics": analytics_engine.report() if analytics_engine else None,
+            "blockhash_prefetch_age_ms": round(blockhash_cache.age_ms, 1) if blockhash_cache else None,
+            "ml_exit": ml_predictor.info() if ml_predictor else None,
+            "counter_intel": counter_intel.stats() if counter_intel else None,
+            "insider_mints": insider_tracker.count() if insider_tracker else 0,
+            "volume_signal_mints": volume_signal.count() if volume_signal else 0,
             **wsnap,
         }
     })
@@ -1826,6 +1948,33 @@ def log_trade(entry_time, exit_time, mint, name, symbol, creator,
             ])
     except Exception:
         pass
+    if side == "SELL":
+        if entry_intel is not None and pnl_pct > 0:
+            try:
+                entry_intel.on_winner(name or "", symbol or "", float(pnl_pct or 0.0))
+            except Exception:
+                pass
+        if entry_intel is not None:
+            try:
+                entry_intel.on_result(_entry_signal_wallet_by_mint.get(mint, ""), float(pnl_sol or 0.0))
+                if "TP1" not in str(reason or ""):
+                    _entry_signal_wallet_by_mint.pop(mint, None)
+            except Exception:
+                pass
+        if analytics_engine is not None:
+            try:
+                analytics_engine.record_trade(
+                    pnl_sol=float(pnl_sol or 0.0),
+                    fee_sol=0.0,
+                    filter_tag=str(reason or "unknown"),
+                )
+                analytics_engine.record_slippage(
+                    expected=float(pnl_pct or 0.0),
+                    realized=float(pnl_pct or 0.0),
+                    size=float(size_sol or 0.0),
+                )
+            except Exception:
+                pass
 
 # =====================================================
 #  UTILS
@@ -1845,6 +1994,172 @@ def is_name_quality(name, symbol):
     if n.isupper() and len(n) > 10:
         return False
     return True
+
+
+def _should_skip_live_sell(
+    sell_size_sol: float,
+    pnl_pct: float,
+    reason: str,
+    is_tp1: bool = False,
+) -> bool:
+    """Guard against dust exits where expected proceeds are below fee floor."""
+    if not MODE_LIVE:
+        return False
+    upper_reason = (reason or "").upper()
+    # KILL is an explicit emergency override path.
+    if "KILL" in upper_reason:
+        return False
+    est_out = sell_size_sol + (sell_size_sol * (pnl_pct / 100.0))
+    min_key = "min_live_tp1_exit_sol" if is_tp1 else "min_live_exit_sol"
+    min_out = float(CONFIG.get(min_key, 0.0) or 0.0)
+    force_skip = bool(CONFIG.get("force_skip_micro_sells", True))
+    if not force_skip and any(k in upper_reason for k in ("RUG", "SL", "VELOCITY", "STALE", "EMERGENCY", "DEVDUMP")):
+        return False
+    return est_out > 0 and est_out < min_out
+
+
+def _fee_capped_tip_sol(requested_tip_sol: float, notional_sol: float) -> float:
+    """Cap priority fee by absolute max and notional percentage."""
+    tip = max(0.0, float(requested_tip_sol or 0.0))
+    cap_abs = max(0.0, float(CONFIG.get("max_tip_sol", tip) or 0.0))
+    pct = max(0.0, float(CONFIG.get("tip_pct_of_notional", 0.0) or 0.0))
+    cap_notional = (notional_sol * pct) if notional_sol > 0 and pct > 0 else cap_abs
+    cap = min(cap_abs, cap_notional) if cap_notional > 0 else cap_abs
+    if cap > 0:
+        tip = min(tip, cap)
+    return max(0.0, tip)
+
+
+def _is_emergency_exit(reason: str, pnl_pct: Optional[float]) -> bool:
+    r = (reason or "").upper()
+    if any(k in r for k in ("RUG", "SL", "VELOCITY", "KILL", "STALE", "DEVDUMP", "EMERGENCY")):
+        return True
+    try:
+        floor = float(CONFIG.get("emergency_tip_pnl_pct", -15.0) or -15.0)
+        if pnl_pct is not None and float(pnl_pct) <= floor:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _sell_tip_sol(requested_tip_sol: float, notional_sol: float, reason: str, pnl_pct: Optional[float]) -> float:
+    tip = _fee_capped_tip_sol(requested_tip_sol, notional_sol)
+    if not bool(CONFIG.get("emergency_tip_enabled", True)):
+        return tip
+    if _is_emergency_exit(reason, pnl_pct):
+        floor = max(0.0, float(CONFIG.get("emergency_tip_floor_sol", 0.0010) or 0.0))
+        return max(tip, floor)
+    return tip
+
+
+def _jupiter_should_fallback(reason: str) -> bool:
+    r = (reason or "").upper()
+    if any(k in r for k in ("RUG", "SL", "VELOCITY", "TIME", "TRAIL", "TP2", "EMERGENCY", "MANUAL")):
+        return True
+    return False
+
+
+def _jupiter_signer() -> Optional[Keypair]:
+    try:
+        if LIVE_KEYPAIR is not None:
+            return LIVE_KEYPAIR
+        env_pk = os.environ.get("BIGAL_PRIVATE_KEY", "").strip()
+        if not env_pk:
+            return None
+        if env_pk.startswith("["):
+            return Keypair.from_bytes(bytes(json.loads(env_pk)))
+        return Keypair.from_bytes(b58decode(env_pk))
+    except Exception:
+        return None
+
+
+async def _jupiter_sell_fallback(mint: str, pct: str = "100%") -> Optional[str]:
+    """Jupiter fallback sell: swap token mint -> SOL and return tx signature."""
+    if not aio_session:
+        return None
+    signer = _jupiter_signer()
+    if signer is None:
+        return None
+    bal_raw = await _wallet_token_balance_for_mint(mint)
+    if bal_raw is None or bal_raw <= 0:
+        return None
+    try:
+        pct_num = float(str(pct).replace("%", "")) if isinstance(pct, str) else float(pct)
+    except Exception:
+        pct_num = 100.0
+    pct_num = max(0.0, min(100.0, pct_num))
+    amount_raw = int(bal_raw * (pct_num / 100.0))
+    if amount_raw <= 0:
+        return None
+
+    slippage_bps = int(CONFIG.get("jupiter_slippage_bps", 1800) or 1800)
+    quote_url = (
+        f"https://quote-api.jup.ag/v6/quote?inputMint={mint}"
+        f"&outputMint=So11111111111111111111111111111111111111112"
+        f"&amount={amount_raw}&slippageBps={slippage_bps}&onlyDirectRoutes=false"
+    )
+    try:
+        async with aio_session.get(quote_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return None
+            quote = await resp.json()
+    except Exception:
+        return None
+
+    out_amount = int(quote.get("outAmount") or 0)
+    min_out_sol = float(CONFIG.get("jupiter_min_output_sol", 0.0010) or 0.0)
+    if out_amount <= 0 or (out_amount / 1e9) < min_out_sol:
+        return None
+
+    swap_body = {
+        "quoteResponse": quote,
+        "userPublicKey": str(signer.pubkey()),
+        "wrapAndUnwrapSol": True,
+        "dynamicComputeUnitLimit": True,
+    }
+    try:
+        async with aio_session.post(
+            "https://quote-api.jup.ag/v6/swap",
+            json=swap_body,
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            swap_json = await resp.json()
+    except Exception:
+        return None
+
+    swap_tx_b64 = swap_json.get("swapTransaction")
+    if not swap_tx_b64:
+        return None
+    try:
+        raw = base64.b64decode(swap_tx_b64)
+        utx = VersionedTransaction.from_bytes(raw)
+        stx = VersionedTransaction(utx.message, [signer])
+        tx_b64 = base64.b64encode(bytes(stx)).decode("ascii")
+    except Exception:
+        return None
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [tx_b64, {"encoding": "base64", "skipPreflight": True, "maxRetries": 2}],
+    }
+    try:
+        async with aio_session.post(
+            HELIUS_RPC_URL,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            sig = data.get("result")
+            return str(sig) if sig else None
+    except Exception:
+        return None
 
 def load_keypair_from_file(path="keypair.txt"):
     with open(path, "r") as f:
@@ -1878,21 +2193,49 @@ async def live_buy_pump(mint, size_sol):
         return "SIMULATED"
     if executor is None:
         return None
-    return await resolved_buy(
-        executor,
+    params = resolve_parameters(CONFIG, adaptive_state)
+    tip_sol = _fee_capped_tip_sol(params["tip"], size_sol)
+    return await executor.buy(
         mint,
         size_sol,
         _effective_slippage(),
-        CONFIG,
-        adaptive_state,
+        tip_sol,
         keypair_b58=live_keypair_b58_for_zmq(),
     )
 
 _SELL_PERSIST_TIMEOUT = float(os.environ.get("SELL_PERSIST_TIMEOUT_SEC", "45"))
 _SELL_PERSIST_PAUSE = float(os.environ.get("SELL_PERSIST_PAUSE_SEC", "0.3"))
+_SELL_OVERFLOW_COOLDOWN_SEC = float(os.environ.get("SELL_OVERFLOW_COOLDOWN_SEC", "120"))
+_SELL_PERM_ERROR_COOLDOWN_SEC = float(os.environ.get("SELL_PERM_ERROR_COOLDOWN_SEC", "60"))
+_sell_overflow_block_until: Dict[str, float] = {}
+_sell_cooldown_notice_ts: Dict[str, float] = {}
 
 
-async def live_sell_pump(mint, pct="100%"):
+def _sell_cooldown_remaining(mint: str) -> float:
+    import time as _time
+    rem = _sell_overflow_block_until.get(mint, 0.0) - _time.monotonic()
+    return rem if rem > 0 else 0.0
+
+
+async def _maybe_log_sell_cooldown(mint: str, name: str, symbol: str, reason: str) -> bool:
+    """Avoid fail-loop spam while overflow/permanent cooldown is active."""
+    rem = _sell_cooldown_remaining(mint)
+    if rem <= 0:
+        return False
+    now = time.time()
+    last = _sell_cooldown_notice_ts.get(mint, 0.0)
+    if now - last >= 8.0:
+        _sell_cooldown_notice_ts[mint] = now
+        msg = (
+            f"⏳ Exit deferred for {name} ({symbol}) | {reason} | "
+            f"sell cooldown {rem:.1f}s"
+        )
+        print(msg)
+        await broadcast_log(msg, "warn")
+    return True
+
+
+async def live_sell_pump(mint, pct="100%", reason: str = "", pnl_pct: Optional[float] = None, _ghost_internal: bool = False):
     """Execute a sell via the active executor backend.
 
     Retries persistently until the sell confirms on chain or a wall-clock
@@ -1904,26 +2247,88 @@ async def live_sell_pump(mint, pct="100%"):
         return True
     if executor is None:
         return False
+    if (
+        not _ghost_internal
+        and bool(CONFIG.get("ghost_sell_enabled", False))
+        and ghost_seller is not None
+    ):
+        try:
+            sell_pct_num = float(str(pct).replace("%", "")) if isinstance(pct, str) else float(pct)
+        except Exception:
+            sell_pct_num = 100.0
+        pos = positions.get(mint) or moonbags.get(mint)
+        pos_size = float(getattr(pos, "remaining_size_sol", 0.0) or 0.0)
+        if ghost_seller.should(pos_size):
+            for chunk in ghost_seller.plan(sell_pct_num, pos_size):
+                delay_ms = int(chunk.get("delay", 0) or 0)
+                if delay_ms > 0:
+                    await asyncio.sleep(delay_ms / 1000.0)
+                chunk_pct = float(chunk.get("pct", sell_pct_num))
+                chunk_arg = f"{chunk_pct:.1f}%"
+                ok = await live_sell_pump(mint, chunk_arg, reason, pnl_pct, _ghost_internal=True)
+                if not ok:
+                    return False
+            return True
 
     import time as _time
+    now = _time.monotonic()
+    blocked_until = _sell_overflow_block_until.get(mint, 0.0)
+    if blocked_until > now:
+        wait_s = blocked_until - now
+        print(
+            f"[SELL] Overflow cooldown active for {mint[:8]}... "
+            f"({wait_s:.1f}s left) — skipping immediate retry loop"
+        )
+        return False
+
     deadline = _time.monotonic() + _SELL_PERSIST_TIMEOUT
     attempt = 0
 
     while _time.monotonic() < deadline:
         attempt += 1
-        sig = await resolved_sell(
-            executor,
+        params = resolve_parameters(CONFIG, adaptive_state)
+        sell_pct_num = float(str(pct).replace("%", "")) if isinstance(pct, str) else float(pct)
+        notional = 0.0
+        pos = positions.get(mint) or moonbags.get(mint)
+        if pos:
+            notional = max(0.0, pos.remaining_size_sol * (sell_pct_num / 100.0))
+        tip_sol = _sell_tip_sol(params["tip"], notional, reason, pnl_pct)
+        sig = await executor.sell(
             mint,
             pct,
             _effective_sell_slippage(),
-            CONFIG,
-            adaptive_state,
+            tip_sol,
             keypair_b58=live_keypair_b58_for_zmq(),
         )
         if sig is not None:
             if attempt > 1:
                 print(f"[SELL] Confirmed on outer attempt {attempt} for {mint[:8]}...")
+            _sell_overflow_block_until.pop(mint, None)
             return True
+
+        try:
+            is_overflow = bool(getattr(executor, "last_sell_overflow")())
+        except Exception:
+            is_overflow = False
+        if is_overflow:
+            _sell_overflow_block_until[mint] = _time.monotonic() + _SELL_OVERFLOW_COOLDOWN_SEC
+            print(
+                f"[SELL] Overflow circuit-breaker tripped for {mint[:8]}... "
+                f"— cooldown {_SELL_OVERFLOW_COOLDOWN_SEC:.0f}s"
+            )
+            break
+
+        try:
+            last_err = str((getattr(executor, "last_sell_error")() or "")).lower()
+        except Exception:
+            last_err = ""
+        if "no tokens found" in last_err or "build failed" in last_err:
+            _sell_overflow_block_until[mint] = _time.monotonic() + _SELL_PERM_ERROR_COOLDOWN_SEC
+            print(
+                f"[SELL] Permanent sell error for {mint[:8]}... "
+                f"({last_err[:80]}) — cooldown {_SELL_PERM_ERROR_COOLDOWN_SEC:.0f}s"
+            )
+            break
 
         remaining = deadline - _time.monotonic()
         if remaining <= 0:
@@ -1936,7 +2341,32 @@ async def live_sell_pump(mint, pct="100%"):
         await asyncio.sleep(pause)
 
     print(f"[SELL] FAILED after {attempt} outer attempts / {_SELL_PERSIST_TIMEOUT}s for {mint[:8]}...")
+    if bool(CONFIG.get("jupiter_fallback_enabled", True)) and _jupiter_should_fallback(reason):
+        j_sig = await _jupiter_sell_fallback(mint, pct)
+        if j_sig:
+            print(f"[SELL] Jupiter fallback succeeded for {mint[:8]}...: {j_sig}")
+            await broadcast_log(f"🪐 Jupiter fallback exit succeeded for {mint[:8]}...", "info")
+            _sell_overflow_block_until.pop(mint, None)
+            return True
     return False
+
+
+async def _post_exit_dust_sweep(mint: str, reason: str, pnl_pct: Optional[float]) -> None:
+    """Try one follow-up full sell for tiny leftovers so ATA can close and rent returns."""
+    if not MODE_LIVE or not bool(CONFIG.get("dust_sweep_enabled", True)):
+        return
+    try:
+        max_units = max(1, int(CONFIG.get("dust_sweep_max_units", 20) or 20))
+    except Exception:
+        max_units = 20
+    bal_raw = await _wallet_token_balance_for_mint(mint)
+    if bal_raw is None or bal_raw <= 0 or bal_raw > max_units:
+        return
+    ok = await live_sell_pump(mint, "100%", f"{reason}:DustSweep", pnl_pct)
+    if ok:
+        msg = f"🧹 Dust sweep closed residual units for {mint[:8]}..."
+        print(msg)
+        await broadcast_log(msg, "info")
 
 # =====================================================
 #  CACHE JANITOR — Periodic TTLCache pruning
@@ -1950,6 +2380,11 @@ async def cache_janitor():
             n1 = seen_names.prune()
             n2 = recent_entry_wallets.prune()
             n3 = _grpc_dedup.prune()
+            active_mints = set(positions.keys()) | set(moonbags.keys())
+            if volume_signal is not None:
+                volume_signal.cleanup(active_mints)
+            if insider_tracker is not None:
+                insider_tracker.cleanup(active_mints)
             if n1 + n2 + n3 > 0:
                 print(f"🧹 Cache prune: seen_names={n1}, recent_wallets={n2}, grpc_dedup={n3}")
         except Exception as e:
@@ -2056,14 +2491,42 @@ async def position_monitor():
         await asyncio.sleep(POSITION_CHECK_INTERVAL)
         now = time.time()
         to_close = []
+        await _maybe_trip_safety_pause()
+
+        if MODE_LIVE and positions:
+            externally_closed = []
+            for mint, pos in list(positions.items()):
+                if pos.closing:
+                    continue
+                # Fresh entries can momentarily read as zero while buy confirmation settles.
+                # Don't drop the local position until grace window passes and buy is known.
+                if (now - pos.entry_time) < float(CONFIG.get("external_close_grace_sec", 25.0) or 25.0):
+                    continue
+                if not pos.buy_tx_sig:
+                    continue
+                bal_raw = await _wallet_token_balance_for_mint(mint)
+                if bal_raw == 0:
+                    externally_closed.append((mint, pos))
+            for mint, pos in externally_closed:
+                async with state_lock:
+                    if mint not in positions:
+                        continue
+                    positions.pop(mint, None)
+                msg = f"🔄 Synced external close for {pos.name} ({pos.symbol}) — removed local position"
+                print(msg)
+                await broadcast_log(msg, "warn")
+                await broadcast_stats()
 
         for mint, pos in list(positions.items()):
             if pos.closing:
                 continue
             hold = now - pos.entry_time
             pnl = (pos.last_price / pos.entry_price - 1.0) * 100.0 if pos.entry_price > 0 else 0
+            max_hold_for_pos = float(CONFIG["max_hold"])
+            if bool(CONFIG.get("dynamic_hold_enabled", True)) and pos.custom_max_hold > 0:
+                max_hold_for_pos = pos.custom_max_hold
 
-            if hold >= CONFIG["max_hold"]:
+            if hold >= max_hold_for_pos:
                 to_close.append((mint, pos, pnl, hold, "Time (monitor)"))
             elif pnl <= -CONFIG["sl"]:
                 to_close.append((mint, pos, pnl, hold, "SL (monitor)"))
@@ -2071,6 +2534,10 @@ async def position_monitor():
                 rug = (pos.last_vsol / pos.entry_vsol - 1.0) * 100.0
                 if rug <= -CONFIG["rug_drop"] or pos.last_vsol < CONFIG["rug_min_vsol"]:
                     to_close.append((mint, pos, pnl, hold, "RUG (monitor)"))
+            if bool(CONFIG.get("volume_exit_enabled", True)) and volume_signal is not None:
+                spike, rate = volume_signal.is_spike(mint)
+                if spike:
+                    to_close.append((mint, pos, pnl, hold, f"VolumeSpike ({rate:.3f}/s)"))
             # Stale price check: if no update in 10s and underwater, force close
             stale = (now - pos.last_update_time) > 10.0
             if stale and pnl < -5.0:
@@ -2102,7 +2569,7 @@ async def position_monitor():
             pnl_sol = active * (pnl_pct / 100.0)
 
             is_profitable = pnl_sol >= 0
-            mb_pct = CONFIG["moonbag_pct"]
+            mb_pct = 0.0 if bool(CONFIG.get("force_full_exit", True)) else CONFIG["moonbag_pct"]
             should_moonbag = (not is_mb and is_profitable and mb_pct > 0 and "RUG" not in reason)
 
             sell_pct = (100 - mb_pct) if should_moonbag else 100
@@ -2111,12 +2578,25 @@ async def position_monitor():
 
             sell_ok = True
             if MODE_LIVE:
+                if _should_skip_live_sell(sell_size, pnl_pct, reason):
+                    async with state_lock:
+                        if mint in source:
+                            source[mint].closing = False
+                    warn = (
+                        f"🪙 EXIT SKIPPED (dust) for {pos.name} ({pos.symbol}) | {reason} | "
+                        "estimated output below fee floor"
+                    )
+                    print(warn)
+                    await broadcast_log(warn, "warn")
+                    continue
                 sell_str = f"{sell_pct}%" if sell_pct < 100 else "100%"
-                sell_ok = await live_sell_pump(mint, sell_str)
+                sell_ok = await live_sell_pump(mint, sell_str, reason, pnl_pct)
                 if not sell_ok:
                     async with state_lock:
                         if mint in source:
                             source[mint].closing = False
+                    if await _maybe_log_sell_cooldown(mint, pos.name, pos.symbol, reason):
+                        continue
                     _bump_counter("sell_failed_chain")
                     warn = (
                         f"⚠ EXIT FAILED on-chain for {pos.name} ({pos.symbol}) | "
@@ -2167,6 +2647,8 @@ async def position_monitor():
                 wsnap = await wallet_chain_snapshot(force_rpc=True)
                 trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
             await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
+            if MODE_LIVE:
+                await _post_exit_dust_sweep(mint, reason, pnl_pct)
             source.pop(mint, None)
 
             if should_moonbag and moonbag_size > 0:
@@ -2189,12 +2671,12 @@ async def position_monitor():
             await broadcast_stats()
 
 # =====================================================
-#  gRPC SIDECAR ZMQ LISTENER
+#  SIDECAR ZMQ LISTENER
 # =====================================================
 
 async def grpc_zmq_listener():
     """
-    Listen for gRPC sightings from the Node.js sidecar via ZMQ SUB.
+    Listen for sidecar sightings from Node.js via ZMQ SUB.
     Converts sidecar messages to PumpPortal-compatible format and
     dispatches to handle_new_token / handle_trade_event.
     Runs in parallel with PumpPortal WS for redundancy.
@@ -2218,8 +2700,8 @@ async def grpc_zmq_listener():
         print("  → Sidecar not running? Start with: cd sidecar && npm start")
         return
 
-    print(f"📡 gRPC sidecar listener connected: {grpc_addr}")
-    await broadcast_log("📡 gRPC sidecar listener connected", "info")
+    print(f"📡 Sidecar listener connected: {grpc_addr}")
+    await broadcast_log("📡 Sidecar listener connected", "info")
 
     poller = zmq.Poller()
     poller.register(sub, zmq.POLLIN)
@@ -2238,7 +2720,9 @@ async def grpc_zmq_listener():
 
             # Dedup: skip if PumpPortal already delivered this event
             mint = msg.get("mint")
-            tx_type = msg.get("txType")
+            tx_type = str(msg.get("txType", "")).lower()
+            if tx_type:
+                msg["txType"] = tx_type
             dedup_key = f"{mint}:{tx_type}:{msg.get('traderPublicKey', '')}"
             if _grpc_dedup.contains(dedup_key):
                 continue
@@ -2246,7 +2730,7 @@ async def grpc_zmq_listener():
 
             grpc_events += 1
             if grpc_events % 50 == 0:
-                print(f"⚡ gRPC sidecar: {grpc_events} events processed")
+                print(f"⚡ Sidecar: {grpc_events} events processed")
 
             # Dispatch to existing handlers (ws=None since gRPC doesn't need WS subscriptions)
             if tx_type == "create":
@@ -2343,6 +2827,8 @@ async def handle_new_token(msg, ws):
     # Feed to wallet profiler (always, regardless of mode)
     if profiler is not None:
         profiler.on_token_create(msg)
+    if entry_intel is not None:
+        entry_intel.on_token_create(creator)
     if mint not in subscribed_trades and ws is not None:
         await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
         subscribed_trades[mint] = True
@@ -2360,6 +2846,9 @@ async def maybe_open_from_candidate(mint, msg):
         return
 
     now = time.time()
+    blocked_until = _blocked_buy_mints_until.get(mint, 0.0)
+    if blocked_until > now:
+        return
     if now < cooldown_until:
         _bump_counter("skip_cooldown")
         return
@@ -2417,6 +2906,7 @@ async def maybe_open_from_candidate(mint, msg):
 
     bc_prog = cand.bc_progress()
     min_buyers = int(CONFIG["entry_buyers"])
+    min_entry_vol = float(CONFIG["entry_vol"])
 
     if tx_type == "buy":
         print(f"👤 {cand.name} ({cand.symbol}) buyers={buyers}/{min_buyers} "
@@ -2455,14 +2945,74 @@ async def maybe_open_from_candidate(mint, msg):
         _bump_counter("skip_too_early")
         return
 
+    # Tier-1 safety: reject obvious honeypots before capital is committed.
+    if bool(CONFIG.get("honeypot_guard_enabled", True)) and honey_guard is not None:
+        safe, reason = await honey_guard.quick_check(mint)
+        if not safe:
+            await broadcast_log(f"🛡 Honeypot guard blocked {cand.name}: {reason}", "warn")
+            candidates.pop(mint, None)
+            return
+
+    intel_score = 0.0
+    if bool(CONFIG.get("entry_intel_enabled", True)) and entry_intel is not None:
+        intel_score, intel_signals = entry_intel.score(
+            mint=mint,
+            name=cand.name,
+            symbol=cand.symbol,
+            creator=cand.creator,
+            buyer_count=buyers,
+            buyer_wallets=cand.unique_buyers,
+        )
+        min_allowed = float(CONFIG.get("entry_intel_min_score", -20.0) or -20.0)
+        if intel_score < min_allowed:
+            await broadcast_log(
+                f"🧠 Entry intelligence skip {cand.name}: score={intel_score:.1f}",
+                "info",
+            )
+            return
+        if intel_signals and tx_type == "buy":
+            why = "; ".join([f"{s.name}:{s.score:+.0f}" for s in intel_signals[:3]])
+            await broadcast_log(f"🧠 Intel {cand.name}: {why} (total={intel_score:+.1f})", "info")
+
+    if intel_score >= 25:
+        min_entry_vol = max(0.2, min_entry_vol * 0.85)
+    elif intel_score <= -10:
+        min_entry_vol = min_entry_vol * 1.15
+
+    entry_score = float(intel_score)
     trade_size = CONFIG["trade_size"]
+    bot_consensus_count = 0
+    if cand.unique_buyers:
+        try:
+            bot_consensus_count, _ = profitable_bots_in_buyers(cand.unique_buyers)
+        except Exception as e:
+            print(f"[ProfilerBridge] lookup failed: {e}")
+            bot_consensus_count = 0
+    if bot_consensus_count > 0:
+        entry_score *= 1.5
+        trade_size *= 1.5
+        await broadcast_log(
+            f"🧬 Profiler boost {cand.name}: {bot_consensus_count} profitable bots detected (x1.5 score/size)",
+            "info",
+        )
+
+    if bool(CONFIG.get("counter_intel_enabled", True)) and counter_intel is not None:
+        counter_intel.enabled = bool(CONFIG.get("counter_intel_enabled", True))
+        if counter_intel.decoy_skip(buyers, buy_vol):
+            _bump_counter("skip_randomized")
+            await broadcast_log(f"🎭 CounterIntel decoy skip {cand.name}", "info")
+            return
+        trade_size = counter_intel.adjust_size(float(trade_size))
+        delay_sec = counter_intel.delay_sec()
+        if delay_sec > 0:
+            await asyncio.sleep(delay_sec)
     if MODE_LIVE and trade_size < MIN_TRADE_SIZE_SOL:
         trade_size = MIN_TRADE_SIZE_SOL
     # Guard: gRPC sidecar + PumpPortal WS can both trigger this concurrently.
     # Acquire state_lock so only one coroutine can create a position per mint.
     # Lock is held through position creation (line positions[mint] = pos) so the
     # second coroutine sees it and returns. Released before the buy RPC call.
-    if buyers >= min_buyers and buy_vol >= CONFIG["entry_vol"] and mint not in positions:
+    if buyers >= min_buyers and buy_vol >= min_entry_vol and mint not in positions:
         async with state_lock:
             # Re-check under lock — the other coroutine may have just bought this mint
             if mint in positions or mint in moonbags:
@@ -2512,8 +3062,11 @@ async def maybe_open_from_candidate(mint, msg):
                 entry_vsol=vsol, last_price=price, max_price=price,
                 last_vsol=vsol, creator=cand.creator,
             )
+            if bool(CONFIG.get("dynamic_hold_enabled", True)) and dynamic_hold is not None:
+                pos.custom_max_hold = dynamic_hold.calc(buyers, buy_vol, entry_score)
             paper_balance -= trade_size
             positions[mint] = pos
+            _entry_signal_wallet_by_mint[mint] = str(trader or "")
 
         log_msg = (f"🟢 ENTRY {cand.name} ({cand.symbol}) | {buyers} buyers | "
                    f"{buy_vol:.2f} SOL | pump={pump:.1f}% | BC={bc_prog:.1f}% | age={age:.1f}s")
@@ -2528,13 +3081,24 @@ async def maybe_open_from_candidate(mint, msg):
             sig = await live_buy_pump(mint, trade_size)
             if sig is None:
                 _bump_counter("buy_failed_chain")
+                try:
+                    last_buy_err = str((getattr(executor, "last_buy_error")() or "")).lower()
+                except Exception:
+                    last_buy_err = ""
+                if any(k in last_buy_err for k in ("6000", "not authorized", "unauthorized")):
+                    block_sec = float(CONFIG.get("buy_block_after_6000_sec", 180.0) or 180.0)
+                    _blocked_buy_mints_until[mint] = time.time() + max(30.0, block_sec)
                 paper_balance += trade_size
                 positions.pop(mint, None)
                 warn = f"⚠ BUY failed on-chain for {cand.name} ({cand.symbol}) | entry skipped"
                 print(warn)
                 await broadcast_log(warn, "warn")
+                await _maybe_trip_safety_pause()
                 return
             pos.buy_tx_sig = sig
+            _blocked_buy_mints_until.pop(mint, None)
+            if bool(CONFIG.get("insider_tracking_enabled", True)) and insider_tracker is not None:
+                asyncio.create_task(insider_tracker.snapshot(mint))
 
         candidates.pop(mint, None)
         await broadcast_stats()
@@ -2551,6 +3115,24 @@ async def handle_trade_event(msg):
     # Feed EVERY trade to the wallet profiler (regardless of mode)
     if profiler is not None:
         profiler.on_trade(msg)
+    if entry_intel is not None:
+        tx = str(msg.get("txType", "")).lower()
+        wallet = (msg.get("traderPublicKey") or msg.get("user") or msg.get("owner") or "").strip()
+        try:
+            vsol_for_grad = float(msg.get("vSolInBondingCurve", 0) or 0.0)
+            if vsol_for_grad > 0:
+                entry_intel.update_grad(mint, vsol_for_grad)
+        except Exception:
+            pass
+        if tx == "buy" and wallet:
+            bot_like = False
+            if profiler is not None:
+                try:
+                    p = profiler.get_profile(wallet)
+                    bot_like = bool(p and getattr(p, "_bot_score", 0) >= 60)
+                except Exception:
+                    bot_like = False
+            entry_intel.on_buy(mint, wallet, is_bot_like=bot_like)
 
     # In rug puller mode, check if target bot hit a honeypot, then skip sniper logic
     if MODE_RUG_PULLER:
@@ -2626,9 +3208,11 @@ async def handle_trade_event(msg):
                         pnl_sol_mb = active_mb * (mb_pnl / 100.0)
                         sell_ok = True
                         if MODE_LIVE:
-                            sell_ok = await live_sell_pump(mint)
+                            sell_ok = await live_sell_pump(mint, "100%", mb_reason or "Moonbag", mb_pnl)
                             if not sell_ok:
                                 mb.closing = False
+                                if await _maybe_log_sell_cooldown(mint, mb.name, mb.symbol, mb_reason or "Moonbag"):
+                                    return
                                 _bump_counter("sell_failed_chain")
                                 warn = f"⚠ Moonbag exit failed on-chain for {mb.name} ({mb.symbol}); keeping open"
                                 print(warn)
@@ -2661,6 +3245,8 @@ async def handle_trade_event(msg):
                             wsnap = await wallet_chain_snapshot(force_rpc=True)
                             trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
                         await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
+                        if MODE_LIVE:
+                            await _post_exit_dust_sweep(mint, mb_reason or "Moonbag", mb_pnl)
                         moonbags.pop(mint, None)
                         print(f"✅ Closed {mb.name} | Bal: {paper_balance:.4f} | W/L: {wins}/{losses}")
                         await broadcast_log(f"✅ Closed {mb.name} | Bal: {paper_balance:.4f}", level)
@@ -2675,6 +3261,55 @@ async def handle_trade_event(msg):
     if pos.closing:
         return  # already being closed by another coroutine
 
+    tx_type = str(msg.get("txType", "")).lower()
+    trader = (msg.get("traderPublicKey") or msg.get("user") or msg.get("owner") or "").strip()
+    try:
+        event_sol_amount = float(msg.get("solAmount", 0) or 0.0)
+    except Exception:
+        event_sol_amount = 0.0
+
+    if bool(CONFIG.get("volume_exit_enabled", True)) and volume_signal is not None and tx_type == "sell":
+        volume_signal.record(mint, max(0.0, event_sol_amount))
+
+    if (
+        bool(CONFIG.get("insider_tracking_enabled", True))
+        and insider_tracker is not None
+        and tx_type == "sell"
+        and trader
+    ):
+        is_insider, held_pct = insider_tracker.is_insider(mint, trader)
+        if is_insider:
+            async with state_lock:
+                if pos.closing:
+                    return
+                pos.closing = True
+            pnl_pct = (price / pos.entry_price - 1.0) * 100.0
+            sell_ok = True
+            if MODE_LIVE:
+                sell_ok = await live_sell_pump(mint, "100%", "EMERGENCY_INSIDER", pnl_pct)
+                if not sell_ok:
+                    pos.closing = False
+                    return
+            now = time.time()
+            hold = now - pos.entry_time
+            active = pos.remaining_size_sol
+            pnl_sol = active * (pnl_pct / 100.0)
+            realized_pnl += pnl_sol
+            if pnl_sol >= 0:
+                wins += 1; consecutive_losses = 0
+            else:
+                losses += 1; consecutive_losses += 1
+            paper_balance += max(active + pnl_sol, 0.0)
+            log_trade(pos.entry_time, now, mint, pos.name, pos.symbol, pos.creator,
+                      "SELL", active, pos.entry_price, price, pnl_sol, pnl_pct, "EMERGENCY_INSIDER")
+            await broadcast_log(
+                f"🚨 INSIDER EXIT {pos.name} ({pos.symbol}) | holder {held_pct:.1f}% dumped",
+                "warn",
+            )
+            positions.pop(mint, None)
+            await broadcast_stats()
+            return
+
     try:
         vsol = float(msg.get("vSolInBondingCurve", 0))
         vtokens = float(msg.get("vTokensInBondingCurve", 0))
@@ -2683,6 +3318,82 @@ async def handle_trade_event(msg):
         price = vsol / vtokens
     except Exception:
         return
+
+    # Dev-dump panic: if creator wallet prints a large sell, emergency exit immediately.
+    panic_enabled = bool(CONFIG.get("dev_dump_panic_enabled", True))
+    if panic_enabled and tx_type == "sell" and pos.creator and trader and trader == pos.creator:
+        try:
+            dev_sell_sol = float(msg.get("solAmount", 0) or 0.0)
+        except Exception:
+            dev_sell_sol = 0.0
+        base_notional = max(float(pos.remaining_size_sol or 0.0), 1e-9)
+        dev_sell_pct = (dev_sell_sol / base_notional) * 100.0 if base_notional > 0 else 0.0
+        min_sol = float(CONFIG.get("dev_dump_min_sol", 0.8) or 0.8)
+        min_pct = float(CONFIG.get("dev_dump_min_pct_position", 20.0) or 20.0)
+        if dev_sell_sol >= min_sol or dev_sell_pct >= min_pct:
+            async with state_lock:
+                if pos.closing:
+                    return
+                pos.closing = True
+            now = time.time()
+            pnl_pct = (price / pos.entry_price - 1.0) * 100.0
+            hold = now - pos.entry_time
+            active = pos.remaining_size_sol
+            pnl_sol = active * (pnl_pct / 100.0)
+            reason = "EMERGENCY_DEVDUMP"
+            sell_ok = True
+            if MODE_LIVE:
+                sell_ok = await live_sell_pump(mint, "100%", reason, pnl_pct)
+                if not sell_ok:
+                    pos.closing = False
+                    if await _maybe_log_sell_cooldown(mint, pos.name, pos.symbol, reason):
+                        return
+                    _bump_counter("sell_failed_chain")
+                    warn = f"⚠ Dev-dump panic exit failed on-chain for {pos.name} ({pos.symbol}); keeping open"
+                    print(warn)
+                    await broadcast_log(warn, "warn")
+                    return
+            realized_pnl += pnl_sol
+            if pnl_sol >= 0:
+                wins += 1; consecutive_losses = 0
+            else:
+                losses += 1; consecutive_losses += 1
+                if pos.creator:
+                    add_to_creator_blacklist(pos.creator, pos.name)
+                if consecutive_losses >= CONFIG["cooldown_losses"]:
+                    cooldown_until = now + CONFIG["cooldown_sec"]
+            paper_balance += max(active + pnl_sol, 0.0)
+            log_trade(pos.entry_time, now, mint, pos.name, pos.symbol, pos.creator,
+                      "SELL", active, pos.entry_price, price, pnl_sol, pnl_pct, reason)
+            log_msg = (
+                f"🚨 DEV DUMP EXIT {pos.name} ({pos.symbol}) | dev sell {dev_sell_sol:.3f} SOL "
+                f"({dev_sell_pct:.1f}% pos) | PnL: {pnl_pct:+.1f}%"
+            )
+            print(log_msg)
+            level = "exit-win" if pnl_sol >= 0 else "exit-loss"
+            await broadcast_log(log_msg, level)
+            confirm_mark = "✅" if MODE_LIVE and sell_ok else ""
+            trade_history.append({
+                "time": datetime.now().strftime("%H:%M:%S"), "timestamp": now * 1000,
+                "name": f"{pos.name} {confirm_mark}".strip(), "symbol": pos.symbol,
+                "pnl_pct": round(pnl_pct, 2), "pnl_sol": round(pnl_sol, 6),
+                "projected_pnl_sol": round(pnl_sol, 6),
+                "execution_confirmed": bool(sell_ok),
+                "confirmation_mark": confirm_mark,
+                "cum_pnl": round(realized_pnl, 6), "balance": round(paper_balance, 4),
+                "hold_time": round(hold, 1), "reason": reason,
+            })
+            if _tracks_live_wallet():
+                wsnap = await wallet_chain_snapshot(force_rpc=True)
+                trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
+            await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
+            if MODE_LIVE:
+                await _post_exit_dust_sweep(mint, reason, pnl_pct)
+            positions.pop(mint, None)
+            print(f"✅ Closed {pos.name} | Bal: {paper_balance:.4f} | W/L: {wins}/{losses}")
+            await broadcast_log(f"✅ Closed {pos.name} | Bal: {paper_balance:.4f}", level)
+            await broadcast_stats()
+            return
 
     # Velocity check — detect sudden price crash
     if CONFIG["velocity_check"] and pos.prev_price > 0:
@@ -2699,9 +3410,11 @@ async def handle_trade_event(msg):
             pnl_sol = active * (pnl_pct / 100.0)
             sell_ok = True
             if MODE_LIVE:
-                sell_ok = await live_sell_pump(mint)
+                sell_ok = await live_sell_pump(mint, "100%", "VelocityDump", pnl_pct)
                 if not sell_ok:
                     pos.closing = False
+                    if await _maybe_log_sell_cooldown(mint, pos.name, pos.symbol, "VelocityDump"):
+                        return
                     _bump_counter("sell_failed_chain")
                     warn = f"⚠ Velocity exit failed on-chain for {pos.name} ({pos.symbol}); keeping open"
                     print(warn)
@@ -2737,6 +3450,8 @@ async def handle_trade_event(msg):
                 wsnap = await wallet_chain_snapshot(force_rpc=True)
                 trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
             await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
+            if MODE_LIVE:
+                await _post_exit_dust_sweep(mint, "VelocityDump", pnl_pct)
             positions.pop(mint, None)
             print(f"✅ Closed {pos.name} | Bal: {paper_balance:.4f} | W/L: {wins}/{losses}")
             await broadcast_log(f"✅ Closed {pos.name} | Bal: {paper_balance:.4f}", level)
@@ -2762,48 +3477,77 @@ async def handle_trade_event(msg):
     rug = rug_drop <= -CONFIG["rug_drop"] or vsol < CONFIG["rug_min_vsol"]
 
     # Partial TP1
-    if not pos.partial_sold and pnl_pct >= CONFIG["tp1"]:
-        async with state_lock:
-            if pos.closing:
+    force_full_exit = bool(CONFIG.get("force_full_exit", True))
+    if (not force_full_exit) and (not pos.partial_sold) and pnl_pct >= CONFIG["tp1"]:
+        if (
+            bool(CONFIG.get("ml_exit_enabled", True))
+            and ml_predictor is not None
+            and ml_predictor.is_trained()
+        ):
+            hold_tp1, conf = ml_predictor.predict(pnl_pct, hold, pos.remaining_size_sol)
+            if hold_tp1:
+                await broadcast_log(
+                    f"🧠 ML hold past TP1 {pos.name} conf={conf:.2f}",
+                    "info",
+                )
                 return
-            pos.closing = True
-        sell_ok = True
-        if MODE_LIVE:
-            sell_ok = await live_sell_pump(mint, "50%")
-            if not sell_ok:
-                pos.closing = False
-                _bump_counter("sell_failed_chain")
-                warn = f"⚠ TP1 sell failed on-chain for {pos.name} ({pos.symbol}); keeping full position"
-                print(warn)
-                await broadcast_log(warn, "warn")
-                return
-        partial_pnl = (pos.size_sol * 0.5) * (pnl_pct / 100.0)
-        realized_pnl += partial_pnl
-        pos.partial_sold = True
-        pos.remaining_size_sol = pos.size_sol * 0.5
-        paper_balance += (pos.size_sol * 0.5) + partial_pnl
+        if MODE_LIVE and pos.size_sol <= float(CONFIG.get("single_exit_under_sol", 0.0) or 0.0):
+            # For small live positions, skip TP1 to avoid paying another high-priority tx fee.
+            pass
+        else:
+            async with state_lock:
+                if pos.closing:
+                    return
+                pos.closing = True
+            sell_ok = True
+            if MODE_LIVE:
+                tp1_size = pos.size_sol * 0.5
+                if _should_skip_live_sell(tp1_size, pnl_pct, "TP1", is_tp1=True):
+                    pos.closing = False
+                    warn = (
+                        f"🪙 TP1 skipped (dust) for {pos.name} ({pos.symbol}) | "
+                        "estimated output below fee floor"
+                    )
+                    print(warn)
+                    await broadcast_log(warn, "warn")
+                    return
+                sell_ok = await live_sell_pump(mint, "50%")
+                if not sell_ok:
+                    pos.closing = False
+                    if await _maybe_log_sell_cooldown(mint, pos.name, pos.symbol, "TP1"):
+                        return
+                    _bump_counter("sell_failed_chain")
+                    warn = f"⚠ TP1 sell failed on-chain for {pos.name} ({pos.symbol}); keeping full position"
+                    print(warn)
+                    await broadcast_log(warn, "warn")
+                    return
+            partial_pnl = (pos.size_sol * 0.5) * (pnl_pct / 100.0)
+            realized_pnl += partial_pnl
+            pos.partial_sold = True
+            pos.remaining_size_sol = pos.size_sol * 0.5
+            paper_balance += (pos.size_sol * 0.5) + partial_pnl
 
-        log_msg = f"💰 TP1 {pos.name} ({pos.symbol}) at +{pnl_pct:.1f}%"
-        print(log_msg)
-        await broadcast_log(log_msg, "exit-win")
-        confirm_mark = "✅" if MODE_LIVE and sell_ok else ""
-        trade_history.append({
-            "time": datetime.now().strftime("%H:%M:%S"), "timestamp": now * 1000,
-            "name": f"{pos.name} {confirm_mark}".strip(), "symbol": pos.symbol,
-            "pnl_pct": round(pnl_pct, 2), "pnl_sol": round(partial_pnl, 6),
-            "projected_pnl_sol": round(partial_pnl, 6),
-            "execution_confirmed": bool(sell_ok),
-            "confirmation_mark": confirm_mark,
-            "cum_pnl": round(realized_pnl, 6), "balance": round(paper_balance, 4),
-            "hold_time": round(hold, 1), "reason": "TP1",
-        })
-        if _tracks_live_wallet():
-            wsnap = await wallet_chain_snapshot(force_rpc=True)
-            trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
-        await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
-        await broadcast_stats()
-        pos.closing = False  # unlock — TP1 is partial, position stays open
-        return
+            log_msg = f"💰 TP1 {pos.name} ({pos.symbol}) at +{pnl_pct:.1f}%"
+            print(log_msg)
+            await broadcast_log(log_msg, "exit-win")
+            confirm_mark = "✅" if MODE_LIVE and sell_ok else ""
+            trade_history.append({
+                "time": datetime.now().strftime("%H:%M:%S"), "timestamp": now * 1000,
+                "name": f"{pos.name} {confirm_mark}".strip(), "symbol": pos.symbol,
+                "pnl_pct": round(pnl_pct, 2), "pnl_sol": round(partial_pnl, 6),
+                "projected_pnl_sol": round(partial_pnl, 6),
+                "execution_confirmed": bool(sell_ok),
+                "confirmation_mark": confirm_mark,
+                "cum_pnl": round(realized_pnl, 6), "balance": round(paper_balance, 4),
+                "hold_time": round(hold, 1), "reason": "TP1",
+            })
+            if _tracks_live_wallet():
+                wsnap = await wallet_chain_snapshot(force_rpc=True)
+                trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
+            await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
+            await broadcast_stats()
+            pos.closing = False  # unlock — TP1 is partial, position stays open
+            return
 
     # Full exit
     tp2 = pnl_pct >= CONFIG["tp2"]
@@ -2824,7 +3568,7 @@ async def handle_trade_event(msg):
     pnl_sol = active * (pnl_pct / 100.0)
     is_profitable = pnl_sol >= 0
 
-    mb_pct = CONFIG["moonbag_pct"]
+    mb_pct = 0.0 if force_full_exit else CONFIG["moonbag_pct"]
     should_moonbag = is_profitable and mb_pct > 0 and "RUG" not in reason
     sell_pct = (100 - mb_pct) if should_moonbag else 100
     sell_size = active * (sell_pct / 100.0)
@@ -2832,10 +3576,21 @@ async def handle_trade_event(msg):
 
     sell_ok = True
     if MODE_LIVE:
+        if _should_skip_live_sell(sell_size, pnl_pct, reason):
+            pos.closing = False
+            warn = (
+                f"🪙 EXIT SKIPPED (dust) for {pos.name} ({pos.symbol}) | {reason} | "
+                "estimated output below fee floor"
+            )
+            print(warn)
+            await broadcast_log(warn, "warn")
+            return
         sell_str = f"{sell_pct}%" if sell_pct < 100 else "100%"
-        sell_ok = await live_sell_pump(mint, sell_str)
+        sell_ok = await live_sell_pump(mint, sell_str, reason, pnl_pct)
         if not sell_ok:
             pos.closing = False
+            if await _maybe_log_sell_cooldown(mint, pos.name, pos.symbol, reason):
+                return
             _bump_counter("sell_failed_chain")
             warn = f"⚠ EXIT FAILED on-chain for {pos.name} ({pos.symbol}) | {reason} | keeping position open"
             print(warn)
@@ -2881,6 +3636,8 @@ async def handle_trade_event(msg):
         wsnap = await wallet_chain_snapshot(force_rpc=True)
         trade_history[-1]["actual_wallet_pnl"] = _actual_wallet_pnl_from_snapshot(wsnap)
     await send_to_dashboard({"type": "trade", "data": trade_history[-1]})
+    if MODE_LIVE:
+        await _post_exit_dust_sweep(mint, reason, pnl_pct)
     positions.pop(mint, None)
 
     if should_moonbag and moonbag_size > 0:
@@ -2978,7 +3735,7 @@ async def emergency_close_all():
             pnl = (pos.last_price / pos.entry_price - 1.0) * 100.0 if pos.entry_price > 0 else 0
             pnl_sol = active * (pnl / 100.0)
             if MODE_LIVE:
-                await live_sell_pump(mint)
+                await live_sell_pump(mint, "100%", "Emergency", pnl)
             realized_pnl += pnl_sol
             if pnl_sol >= 0: wins += 1
             else: losses += 1
@@ -2998,39 +3755,120 @@ async def get_live_balance():
                 return bal
         except Exception:
             pass
-    # Direct RPC fallback — works in Rust mode where executor has no balance method
-    if aio_session and HELIUS_RPC_URL and "YOUR_API_KEY_HERE" not in HELIUS_RPC_URL:
+    # Direct RPC fallback — robust in Rust mode when LegacyExecutor balance RPC fails.
+    if not HELIUS_RPC_URL or "YOUR_API_KEY_HERE" in HELIUS_RPC_URL:
+        return None
+    try:
+        pubkey = None
+        # 1) Dashboard-selected wallet
+        if LIVE_KEYPAIR is not None:
+            pubkey = str(LIVE_KEYPAIR.pubkey())
+        # 2) Legacy fallback signer (if wired under ZmqExecutor)
+        elif executor is not None and getattr(executor, "_fallback", None) is not None:
+            fb = getattr(executor, "_fallback")
+            fb_kp = getattr(fb, "_keypair", None)
+            if fb_kp is not None:
+                pubkey = str(fb_kp.pubkey())
+        # 3) Environment private key
+        elif os.environ.get("BIGAL_PRIVATE_KEY"):
+            from solders.keypair import Keypair as SoldersKeypair
+            pk = os.environ["BIGAL_PRIVATE_KEY"].strip()
+            if pk.startswith("["):
+                kp = SoldersKeypair.from_bytes(bytes(json.loads(pk)))
+            else:
+                kp = SoldersKeypair.from_bytes(b58decode(pk))
+            pubkey = str(kp.pubkey())
+        if not pubkey:
+            return None
+
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getBalance",
+            "params": [pubkey, {"commitment": "processed"}]
+        }
+        session = aio_session
+        owns_session = False
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+            owns_session = True
         try:
-            # Determine wallet pubkey: prefer LIVE_KEYPAIR, else BIGAL_PRIVATE_KEY-derived
-            pubkey = None
-            if LIVE_KEYPAIR is not None:
-                pubkey = str(LIVE_KEYPAIR.pubkey())
-            elif os.environ.get("BIGAL_PRIVATE_KEY"):
-                # Rust executor wallet — derive pubkey from env
-                from solders.keypair import Keypair as SoldersKeypair
-                pk = os.environ["BIGAL_PRIVATE_KEY"].strip()
-                if pk.startswith("["):
-                    kp = SoldersKeypair.from_bytes(bytes(json.loads(pk)))
-                else:
-                    kp = SoldersKeypair.from_bytes(b58decode(pk))
-                pubkey = str(kp.pubkey())
-            if not pubkey:
-                return None
-            payload = {
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getBalance",
-                "params": [pubkey, {"commitment": "processed"}]
-            }
-            async with aio_session.post(HELIUS_RPC_URL, json=payload,
-                                         timeout=aiohttp.ClientTimeout(total=4)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    lamports = data.get("result", {}).get("value")
-                    if lamports is not None:
-                        return int(lamports) / 1e9
-        except Exception:
-            pass
+            async with session.post(
+                HELIUS_RPC_URL,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=4)
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                lamports = data.get("result", {}).get("value")
+                if lamports is not None:
+                    return int(lamports) / 1e9
+        finally:
+            if owns_session:
+                await session.close()
+    except Exception:
+        pass
     return None
+
+
+def _current_wallet_pubkey_str() -> Optional[str]:
+    try:
+        if LIVE_KEYPAIR is not None:
+            return str(LIVE_KEYPAIR.pubkey())
+        if executor is not None and getattr(executor, "_fallback", None) is not None:
+            fb = getattr(executor, "_fallback")
+            fb_kp = getattr(fb, "_keypair", None)
+            if fb_kp is not None:
+                return str(fb_kp.pubkey())
+        env_pk = os.environ.get("BIGAL_PRIVATE_KEY", "").strip()
+        if env_pk:
+            from solders.keypair import Keypair as SoldersKeypair
+            if env_pk.startswith("["):
+                kp = SoldersKeypair.from_bytes(bytes(json.loads(env_pk)))
+            else:
+                kp = SoldersKeypair.from_bytes(b58decode(env_pk))
+            return str(kp.pubkey())
+    except Exception:
+        return None
+    return None
+
+
+async def _wallet_token_balance_for_mint(mint: str) -> Optional[int]:
+    if not aio_session or not HELIUS_RPC_URL or "YOUR_API_KEY_HERE" in HELIUS_RPC_URL:
+        return None
+    owner = _current_wallet_pubkey_str()
+    if not owner:
+        return None
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenAccountsByOwner",
+        "params": [
+            owner,
+            {"mint": mint},
+            {"encoding": "jsonParsed", "commitment": "processed"},
+        ],
+    }
+    try:
+        async with aio_session.post(
+            HELIUS_RPC_URL, json=payload, timeout=aiohttp.ClientTimeout(total=4)
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            total_raw = 0
+            for entry in (data.get("result", {}) or {}).get("value", []) or []:
+                amt = (
+                    (((entry.get("account") or {}).get("data") or {}).get("parsed") or {})
+                    .get("info", {})
+                    .get("tokenAmount", {})
+                    .get("amount")
+                )
+                if amt is not None:
+                    total_raw += int(amt)
+            return total_raw
+    except Exception:
+        return None
 
 def load_wallet_from_input(wallet_input):
     """Load keypair from base58 private key or JSON array."""
@@ -3050,10 +3888,26 @@ def load_wallet_from_input(wallet_input):
 async def run_bot():
     global MODE_LIVE, LIVE_CLIENT, LIVE_KEYPAIR, aio_session, paper_balance
     global executor, EXECUTOR_MODE, mode_selected_event
+    global honey_guard, entry_intel, blockhash_cache, analytics_engine
+    global ml_predictor, ghost_seller, counter_intel, dynamic_hold, volume_signal, insider_tracker
 
     load_creator_blacklist()
+    init_profiler_db()
 
     aio_session = aiohttp.ClientSession()
+    honey_guard = HoneypotGuard(HELIUS_RPC_URL, aio_session)
+    entry_intel = EntryIntelligence()
+    analytics_engine = AnalyticsEngine()
+    blockhash_cache = BlockhashCache(HELIUS_RPC_URL, refresh_ms=400)
+    ml_predictor = MLExitPredictor()
+    ml_predictor.train(TRADE_JOURNAL_FILE)
+    ghost_seller = GhostSeller()
+    counter_intel = CounterIntel(enabled=bool(CONFIG.get("counter_intel_enabled", True)))
+    dynamic_hold = DynamicHold(base=float(CONFIG.get("max_hold", 60.0)))
+    volume_signal = VolumeExitSignal()
+    insider_tracker = InsiderTracker(rpc_url=HELIUS_RPC_URL, session=aio_session)
+    if bool(CONFIG.get("blockhash_prefetch_enabled", True)):
+        await blockhash_cache.start()
 
     # Start HTTP server for dashboard
     http_thread = threading.Thread(target=start_http_server, daemon=True)
@@ -3144,6 +3998,8 @@ async def run_bot():
                 await broadcast_log(f"❌ Error: {e} — reconnecting...", "warn")
                 await asyncio.sleep(5)
     finally:
+        if blockhash_cache is not None:
+            await blockhash_cache.stop()
         if aio_session:
             await aio_session.close()
         srv.close()
