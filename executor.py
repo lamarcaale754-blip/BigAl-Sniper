@@ -48,11 +48,64 @@ DEFAULT_ZMQ_RESULT_IPC = "ipc:///tmp/bigal_result.ipc"
 _RUST_SELL_ATTEMPTS = max(1, int(os.environ.get("ZMQ_SELL_RUST_ATTEMPTS", "2")))
 _RUST_SELL_BACKOFF_MAX = float(os.environ.get("ZMQ_SELL_BACKOFF_MAX", "0.85"))
 _ZMQ_SELL_WAIT_SEC = float(os.environ.get("ZMQ_SELL_WAIT_SEC", "45"))
-_ZMQ_SELL_PREFLIGHT_MS = max(0, int(os.environ.get("ZMQ_SELL_PREFLIGHT_MS", "0")))
+_ZMQ_SELL_PREFLIGHT_MS = max(0, int(os.environ.get("ZMQ_SELL_PREFLIGHT_MS", "500")))
 _SELL_RETRY_IMMEDIATE_ON_TIMEOUT = os.environ.get("ZMQ_SELL_RETRY_ON_TIMEOUT", "0").strip().lower() not in (
     "0", "false", "no", "off",
 )
 _BIGAL_SELL_TIP_MULT = max(1.0, float(os.environ.get("BIGAL_SELL_TIP_MULT", "1.0")))
+_OVERFLOW_SELL_LADDER = os.environ.get("BIGAL_OVERFLOW_SELL_LADDER", "95,90,80,70")
+_DEFAULT_PRIORITY_FEE_SOL = float(os.environ.get("BIGAL_PRIORITY_FALLBACK_SOL", "0.002"))
+_PRIORITY_CACHE_TTL_SEC = float(os.environ.get("BIGAL_PRIORITY_CACHE_TTL_SEC", "1.0"))
+_priority_cache: dict[str, dict[str, float]] = {}
+
+
+async def _fetch_helius_extreme_priority_fee_sol(mint: Optional[str] = None) -> float:
+    """Resolve priority fee from Helius (extreme level), with short cache + safe fallback."""
+    cache_key = mint or "_global"
+    now = time.monotonic()
+    cached = _priority_cache.get(cache_key)
+    if cached and (now - float(cached.get("ts", 0.0)) <= _PRIORITY_CACHE_TTL_SEC):
+        return float(cached.get("fee_sol", _DEFAULT_PRIORITY_FEE_SOL))
+
+    rpc_url = (os.environ.get("HELIUS_RPC_URL", "") or "").strip()
+    if not rpc_url:
+        return _DEFAULT_PRIORITY_FEE_SOL
+
+    try:
+        import aiohttp
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getPriorityFeeEstimate",
+            "params": [{
+                "options": {
+                    "includeAllPriorityFeeLevels": True,
+                    "priorityLevel": "UnsafeMax",
+                }
+            }],
+        }
+        if mint:
+            payload["params"][0]["accountKeys"] = [mint]
+        timeout = aiohttp.ClientTimeout(total=1.2, connect=0.5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(rpc_url, json=payload) as resp:
+                if resp.status != 200:
+                    return _DEFAULT_PRIORITY_FEE_SOL
+                data = await resp.json(content_type=None)
+        result = (data or {}).get("result") or {}
+        levels = result.get("priorityFeeLevels") or result.get("priority_fee_levels") or {}
+        fee_lamports = (
+            levels.get("unsafeMax")
+            or levels.get("extreme")
+            or result.get("priorityFeeEstimate")
+            or result.get("priority_fee_estimate")
+            or 0
+        )
+        fee_sol = max(_DEFAULT_PRIORITY_FEE_SOL, float(fee_lamports) / 1e9)
+        _priority_cache[cache_key] = {"fee_sol": fee_sol, "ts": now}
+        return fee_sol
+    except Exception:
+        return _DEFAULT_PRIORITY_FEE_SOL
 
 
 def _rust_sell_should_retry(result: Optional[dict]) -> bool:
@@ -96,6 +149,28 @@ def _sell_retry_delay_sec(last_result: Optional[dict]) -> float:
     if any(s in err for s in ("token", "balance", "account", "index", "not found", "0 tokens")):
         return min(_RUST_SELL_BACKOFF_MAX, 0.55)
     return min(_RUST_SELL_BACKOFF_MAX, 0.22)
+
+
+def _is_overflow_error(result: Optional[dict]) -> bool:
+    if not result:
+        return False
+    err = (result.get("error") or "").lower()
+    return any(s in err for s in ("overflow", "6024", "0x1788"))
+
+
+def _overflow_pct_ladder(base_pct: float) -> list[float]:
+    vals: list[float] = []
+    for raw in _OVERFLOW_SELL_LADDER.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            v = float(raw)
+        except ValueError:
+            continue
+        if 0 < v < base_pct and v not in vals:
+            vals.append(v)
+    return vals
 
 
 class ExecutorBackend(ABC):
@@ -192,7 +267,7 @@ class LegacyExecutor(ExecutorBackend):
             self._aio_session = aiohttp.ClientSession()
 
     async def _trade(self, action, mint, amount, denominated_in_sol=True,
-                     slippage=10, priority_fee=0.002):
+                     slippage=25, priority_fee=0.002):
         await self._ensure_session()
         t0 = time.monotonic()
 
@@ -262,7 +337,10 @@ class LegacyExecutor(ExecutorBackend):
                                   priority_fee=priority_fee)
 
     async def sell(self, mint, pct, slippage, priority_fee, keypair_b58=None):
-        sig = await self._trade("sell", mint, pct,
+        safe_pct = str(pct).strip()
+        if not safe_pct.endswith("%"):
+            safe_pct = f"{safe_pct}%"
+        sig = await self._trade("sell", mint, safe_pct,
                                  denominated_in_sol=False,
                                  slippage=slippage,
                                  priority_fee=priority_fee)
@@ -330,6 +408,9 @@ class ZmqExecutor(ExecutorBackend):
         self._connected = False
         self._seq = 0
         self._adaptive_state: Optional[AdaptiveState] = None
+        self._last_buy_error: Optional[str] = None
+        self._last_sell_error: Optional[str] = None
+        self._last_sell_overflow: bool = False
 
     def set_adaptive_state(self, state: AdaptiveState):
         """Wire adaptive state so Rust fee data feeds back into Python."""
@@ -345,6 +426,15 @@ class ZmqExecutor(ExecutorBackend):
             print(f"[ZmqExecutor] Rust {action} returned status={status!r}: {err}")
         elif status and status != "confirmed":
             print(f"[ZmqExecutor] Rust {action} status={status!r} (no error field)")
+
+    def last_sell_overflow(self) -> bool:
+        return self._last_sell_overflow
+
+    def last_buy_error(self) -> Optional[str]:
+        return self._last_buy_error
+
+    def last_sell_error(self) -> Optional[str]:
+        return self._last_sell_error
 
     async def _send_signal(self, action: str, mint: str, amount,
                            amount_type: str, slippage_bps: int,
@@ -409,6 +499,7 @@ class ZmqExecutor(ExecutorBackend):
             return result
 
     async def buy(self, mint, size_sol, slippage, priority_fee, keypair_b58=None):
+        self._last_buy_error = None
         fee_lamports = int(priority_fee * 1e9) if priority_fee > 0 else 0
         result = await self._send_signal("buy", mint, size_sol, "sol",
                                           int(slippage * 100),
@@ -419,15 +510,19 @@ class ZmqExecutor(ExecutorBackend):
             method = result.get("method", "unknown")
             lat = result.get("latency", {}).get("total_ms", 0)
             print(f"[ZmqExecutor] BUY via {method} in {lat:.0f}ms: {sig}")
+            self._last_buy_error = None
             return sig
 
         self._log_rust_rejection("buy", result)
+        self._last_buy_error = (result or {}).get("error")
         # No Legacy fallback — Rust path has better slippage and Jito protection.
         print("[ZmqExecutor] BUY FAILED via Rust — skipping (no Legacy fallback)")
         return None
 
     async def sell(self, mint, pct, slippage, priority_fee, keypair_b58=None):
         """Sell via Rust first; short bounded retries (reliable), optional instant timeout retry via env."""
+        self._last_sell_error = None
+        self._last_sell_overflow = False
         pct_val = float(str(pct).replace("%", "")) if isinstance(pct, str) else float(pct)
         base_fee = priority_fee * _BIGAL_SELL_TIP_MULT
         fee_lamports = int(base_fee * 1e9) if base_fee > 0 else 0
@@ -475,9 +570,54 @@ class ZmqExecutor(ExecutorBackend):
                     )
                 else:
                     print(f"[ZmqExecutor] SELL via {method} in {lat:.0f}ms: {sig}")
+                self._last_sell_error = None
+                self._last_sell_overflow = False
                 return sig
 
+        # Overflow mitigation: try up to 2 reduced percentages, then stop.
+        if _is_overflow_error(last_result):
+            ladder = _overflow_pct_ladder(pct_val)
+            if ladder:
+                print(
+                    f"[ZmqExecutor] SELL overflow detected for {mint[:8]}... "
+                    f"— trying reduced pct ladder: {ladder[:2]}"
+                )
+            for idx, reduced_pct in enumerate(ladder[:2], start=1):
+                result = await self._send_signal(
+                    "sell",
+                    mint,
+                    reduced_pct,
+                    "pct",
+                    int(slippage * 100),
+                    priority="urgent",
+                    priority_fee_lamports=fee_lamports,
+                    keypair_b58=keypair_b58,
+                    timeout=_ZMQ_SELL_WAIT_SEC,
+                )
+                last_result = result
+                if result and result.get("status") == "confirmed":
+                    sig = result.get("signature")
+                    method = result.get("method", "unknown")
+                    lat = result.get("latency", {}).get("total_ms", 0)
+                    print(
+                        f"[ZmqExecutor] SELL overflow fallback succeeded "
+                        f"({reduced_pct:.0f}%, step {idx}) via {method} in {lat:.0f}ms: {sig}"
+                    )
+                    self._last_sell_error = None
+                    self._last_sell_overflow = False
+                    return sig
+                if _is_overflow_error(result):
+                    print(
+                        f"[ZmqExecutor] SELL overflow persists at {reduced_pct:.0f}% "
+                        f"(step {idx})"
+                    )
+                    continue
+                # Non-overflow failure: don't cascade extra tx attempts.
+                break
+
         self._log_rust_rejection("sell", last_result)
+        self._last_sell_overflow = _is_overflow_error(last_result)
+        self._last_sell_error = (last_result or {}).get("error")
         # Never fall back to Legacy for sells — its 15% slippage destroys PnL.
         # If Rust fails 3 times the position stays open for the next monitor cycle.
         err_detail = (last_result or {}).get("error", "unknown")
@@ -556,8 +696,9 @@ async def resolved_buy(backend: ExecutorBackend, mint: str, size_sol: float,
     (dashboard / LIVE_KEYPAIR), not only ``BIGAL_PRIVATE_KEY`` in the Rust process env.
     """
     params = resolve_parameters(config, adaptive_state)
+    fee_sol = await _fetch_helius_extreme_priority_fee_sol(mint=mint)
     return await backend.buy(
-        mint, size_sol, slippage, params["tip"], keypair_b58=keypair_b58
+        mint, size_sol, slippage, fee_sol or params["tip"], keypair_b58=keypair_b58
     )
 
 
@@ -570,6 +711,7 @@ async def resolved_sell(backend: ExecutorBackend, mint: str, pct: str,
     Pass ``keypair_b58`` for ZmqExecutor so Rust uses the same signer as Legacy (see resolved_buy).
     """
     params = resolve_parameters(config, adaptive_state)
+    fee_sol = await _fetch_helius_extreme_priority_fee_sol(mint=mint)
     return await backend.sell(
-        mint, pct, slippage, params["tip"], keypair_b58=keypair_b58
+        mint, pct, slippage, fee_sol or params["tip"], keypair_b58=keypair_b58
     )

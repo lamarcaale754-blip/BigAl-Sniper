@@ -615,6 +615,16 @@
         <div class="ctrl-row" id="random_skip_pct_row"></div>
       </div>
 
+      <div class="ctrl-group">
+        <div class="ctrl-group-title">HFT Features</div>
+        <div class="ctrl-row" id="ghost_sell_enabled_row"></div>
+        <div class="ctrl-row" id="counter_intel_enabled_row"></div>
+        <div class="ctrl-row" id="ml_exit_enabled_row"></div>
+        <div class="ctrl-row" id="dynamic_hold_enabled_row"></div>
+        <div class="ctrl-row" id="insider_tracking_enabled_row"></div>
+        <div class="ctrl-row" id="volume_exit_enabled_row"></div>
+      </div>
+
       <!-- STRATEGY MODE -->
       <div class="ctrl-group" id="strategyModeGroup">
         <div class="ctrl-group-title" style="color:#b388ff">Strategy Mode</div>
@@ -1188,12 +1198,18 @@ const SLIDERS = [
   {key:'min_wallet_diversity',label:'Wallet Diversity',min:0.1,max:0.9,step:0.1,unit:'',row:'min_wallet_diversity_row', fmt:v=>(v*100).toFixed(0)+'%'},
   {key:'max_repeat_wallets',label:'Max Repeat Wallets',min:1,max:8,step:1,unit:'',  row:'max_repeat_wallets_row'},
   {key:'random_skip_pct',label:'Random Skip',min:0,   max:30,   step:1,    unit:'%',   row:'random_skip_pct_row'},
+  {key:'ghost_sell_enabled',label:'Ghost Sell',min:0,max:1,step:1,unit:'',row:'ghost_sell_enabled_row',fmt:v=>v==1?'ON':'OFF'},
+  {key:'counter_intel_enabled',label:'Counter Intel',min:0,max:1,step:1,unit:'',row:'counter_intel_enabled_row',fmt:v=>v==1?'ON':'OFF'},
+  {key:'ml_exit_enabled',label:'ML Exit',min:0,max:1,step:1,unit:'',row:'ml_exit_enabled_row',fmt:v=>v==1?'ON':'OFF'},
+  {key:'dynamic_hold_enabled',label:'Dynamic Hold',min:0,max:1,step:1,unit:'',row:'dynamic_hold_enabled_row',fmt:v=>v==1?'ON':'OFF'},
+  {key:'insider_tracking_enabled',label:'Insider Tracking',min:0,max:1,step:1,unit:'',row:'insider_tracking_enabled_row',fmt:v=>v==1?'ON':'OFF'},
+  {key:'volume_exit_enabled',label:'Volume Exit',min:0,max:1,step:1,unit:'',row:'volume_exit_enabled_row',fmt:v=>v==1?'ON':'OFF'},
   {key:'max_positions',label:'Max Positions',min:1,   max:15,   step:1,    unit:'',    row:'max_positions_row'},
   {key:'trade_size',label:'Trade Size',     min:0.01, max:0.10, step:0.01, unit:' SOL',row:'trade_size_row'},
   {key:'cooldown_losses',label:'Cooldown After',min:2,max:15,  step:1,    unit:' losses',row:'cooldown_losses_row'},
   {key:'cooldown_sec',label:'Cooldown Duration',min:5,max:60,  step:5,    unit:'s',   row:'cooldown_sec_row'},
   // Strategy mode manual values
-  {key:'manual_tip',label:'Manual Tip',min:0.001,max:0.02,step:0.001,unit:' SOL',row:'manual_tip_row'},
+  {key:'manual_tip',label:'Manual Tip',min:0.001,max:0.02,step:0.001,unit:' SOL',row:'manual_tip_row',decimals:3},
   {key:'manual_min_liquidity',label:'Manual Min Liquidity',min:0.1,max:3.0,step:0.1,unit:' SOL',row:'manual_min_liquidity_row'},
   {key:'manual_entry_progress',label:'Manual Entry BC',min:0.5,max:10,step:0.5,unit:'%',row:'manual_entry_progress_row'},
   // Strategy mode hybrid overrides (0=adaptive, 1=use manual)
@@ -1205,6 +1221,7 @@ const SLIDERS = [
 function fmtVal(s, v) {
   if (s.fmt) return s.fmt(v);
   const n = Number(v);
+  if (typeof s.decimals === 'number') return n.toFixed(s.decimals) + (s.unit||'');
   if (s.step < 1) return n.toFixed(s.step < 0.1 ? 2 : 1) + (s.unit||'');
   return n + (s.unit||'');
 }
