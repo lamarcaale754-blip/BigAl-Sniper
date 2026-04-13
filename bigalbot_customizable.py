@@ -279,6 +279,8 @@ CONFIG = {
     "min_pool": 0.3,
     # Risk
     "max_positions": 10, "trade_size": 0.05,
+    # Rust executor sell min-out (percent). Wider = fewer reverts on fast dumps; max 35.
+    "rust_sell_slippage_pct": 18,
     "cooldown_losses": 8, "cooldown_sec": 10.0,
     # Moonbag
     "moonbag_pct": 10.0, "moonbag_expire": 120.0,
@@ -447,12 +449,22 @@ MIN_SYMBOL_LENGTH = 2
 MAX_SYMBOL_LENGTH = 10
 
 PUMPPORTAL_TRADE_LOCAL = "https://pumpportal.fun/api/trade-local"
+# Buys: tight min-out is fine (you control size). Sells: curve moves during the hold — 3% sell
+# slippage caused mass Rust sell reverts + Legacy fallback (15% there masked the issue).
 PUMP_SLIPPAGE_PCT_BY_MODE = {"zmq_rust": 3, "legacy": 15, "paper": 10}
 
 def _effective_slippage() -> int:
-    """Return slippage % for the current executor mode.
-    Jito bundles (zmq_rust) can't be sandwiched → tight 3%.
-    Legacy HTTP is unprotected → needs 15% buffer."""
+    """Return slippage % for BUYS in the current executor mode."""
+    return PUMP_SLIPPAGE_PCT_BY_MODE.get(EXECUTOR_MODE, 10)
+
+
+def _effective_sell_slippage() -> int:
+    """Return slippage % for SELLS. Rust path needs a wide min-SOL-out like competitive bots."""
+    if EXECUTOR_MODE == "zmq_rust":
+        v = CONFIG.get("rust_sell_slippage_pct")
+        if v is not None:
+            return max(5, min(35, int(v)))
+        return 18
     return PUMP_SLIPPAGE_PCT_BY_MODE.get(EXECUTOR_MODE, 10)
 
 PUMP_PRIORITY_FEE_SOL = 0.002
@@ -1819,7 +1831,7 @@ async def live_sell_pump(mint, pct="100%"):
         executor,
         mint,
         pct,
-        _effective_slippage(),
+        _effective_sell_slippage(),
         CONFIG,
         adaptive_state,
         keypair_b58=live_keypair_b58_for_zmq(),

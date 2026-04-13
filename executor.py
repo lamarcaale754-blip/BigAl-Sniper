@@ -10,14 +10,18 @@ ZMQ: on Linux, Python binds/connects via `ipc:///tmp/bigal_*.ipc` (see zmq_bridg
 Rust reads `ZMQ_SIGNAL_IPC` / `ZMQ_RESULT_IPC` for the same paths on Unix.
 Set `JITO_BLOCK_ENGINE` to the NY (US East) Jito URL for `us-east-1` hosts.
 
-Sell path tuning (ghost balance / RPC lag):
+Sell path tuning (reliability first; sub-second retries, no multi-second backoff):
   ZMQ_SELL_RUST_ATTEMPTS — Python↔Rust sell retries before Legacy (default 3).
-  ZMQ_SELL_BACKOFF_MAX — max seconds between those retries (default 2.0).
+  ZMQ_SELL_BACKOFF_MAX — cap on retry sleep after errors / timeouts (default 0.85s).
+  ZMQ_SELL_RETRY_ON_TIMEOUT — if 1, ZMQ timeout → immediate retry (default 0: short cooldown so in-flight txs can land).
 Rust executor: balance cache from buy + parallel RPC + dual Jito+RPC racing handle most latency.
   HELIUS_READ_RPC_URL — dedicated Helius HTTP URL for token balance polls.
   BIGAL_SELL_BALANCE_RETRIES / BIGAL_SELL_BALANCE_POLL_MS — fallback patience when cache misses (defaults 20 / 200ms).
-  ZMQ_SELL_WAIT_SEC — max wait per Rust sell build (default 15).
-  ZMQ_SELL_PREFLIGHT_MS — optional sleep before first sell attempt (default 0).
+  ZMQ_SELL_WAIT_SEC — max wait per Rust sell round-trip (default 45; must exceed land+build).
+  ZMQ_SELL_PREFLIGHT_MS — optional sleep before first sell (default 0).
+  BIGAL_SELL_TIP_MULT — multiply resolved priority fee for sells only (default 1.0 = same as strategy; raise e.g. 1.15 for harder exits).
+  BIGAL_SELL_RPC_ONLY — if true/1, Rust sells use RPC only (log always shows SELL via rpc).
+  BIGAL_LAND_TIMEOUT_SEC — max seconds for Jito+RPC land race in Rust (default 28).
 """
 
 import asyncio
@@ -39,9 +43,13 @@ DEFAULT_ZMQ_RESULT_IPC = "ipc:///tmp/bigal_result.ipc"
 # Jito+RPC submission internally, so Python needs far fewer retries.
 # Override via env vars if needed (e.g. ZMQ_SELL_RUST_ATTEMPTS=8 for old behavior).
 _RUST_SELL_ATTEMPTS = max(1, int(os.environ.get("ZMQ_SELL_RUST_ATTEMPTS", "3")))
-_RUST_SELL_BACKOFF_MAX = float(os.environ.get("ZMQ_SELL_BACKOFF_MAX", "2.0"))
-_ZMQ_SELL_WAIT_SEC = float(os.environ.get("ZMQ_SELL_WAIT_SEC", "15"))
+_RUST_SELL_BACKOFF_MAX = float(os.environ.get("ZMQ_SELL_BACKOFF_MAX", "0.85"))
+_ZMQ_SELL_WAIT_SEC = float(os.environ.get("ZMQ_SELL_WAIT_SEC", "45"))
 _ZMQ_SELL_PREFLIGHT_MS = max(0, int(os.environ.get("ZMQ_SELL_PREFLIGHT_MS", "0")))
+_SELL_RETRY_IMMEDIATE_ON_TIMEOUT = os.environ.get("ZMQ_SELL_RETRY_ON_TIMEOUT", "0").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+_BIGAL_SELL_TIP_MULT = max(1.0, float(os.environ.get("BIGAL_SELL_TIP_MULT", "1.0")))
 
 
 def _rust_sell_should_retry(result: Optional[dict]) -> bool:
@@ -62,6 +70,19 @@ def _rust_sell_should_retry(result: Optional[dict]) -> bool:
     if any(s in err for s in permanent):
         return False
     return True
+
+
+def _sell_retry_delay_sec(last_result: Optional[dict]) -> float:
+    """Seconds to wait before another Rust sell (avoids piling on while RPC/index catches up)."""
+    if last_result is None:
+        if _SELL_RETRY_IMMEDIATE_ON_TIMEOUT:
+            return 0.0
+        # Timeout may mean Rust is still landing; brief pause before duplicate signal.
+        return min(_RUST_SELL_BACKOFF_MAX, 0.28)
+    err = (last_result.get("error") or "").lower()
+    if any(s in err for s in ("token", "balance", "account", "index", "not found", "0 tokens")):
+        return min(_RUST_SELL_BACKOFF_MAX, 0.55)
+    return min(_RUST_SELL_BACKOFF_MAX, 0.22)
 
 
 class ExecutorBackend(ABC):
@@ -393,9 +414,10 @@ class ZmqExecutor(ExecutorBackend):
         return None
 
     async def sell(self, mint, pct, slippage, priority_fee, keypair_b58=None):
-        """Sell via Rust first; retry transient failures before Legacy (fee savings)."""
+        """Sell via Rust first; short bounded retries (reliable), optional instant timeout retry via env."""
         pct_val = float(str(pct).replace("%", "")) if isinstance(pct, str) else float(pct)
-        fee_lamports = int(priority_fee * 1e9) if priority_fee > 0 else 0
+        base_fee = priority_fee * _BIGAL_SELL_TIP_MULT
+        fee_lamports = int(base_fee * 1e9) if base_fee > 0 else 0
         last_result: Optional[dict] = None
 
         if _ZMQ_SELL_PREFLIGHT_MS > 0:
@@ -405,15 +427,17 @@ class ZmqExecutor(ExecutorBackend):
             if attempt > 1:
                 if not _rust_sell_should_retry(last_result):
                     break
-                delay = min(
-                    _RUST_SELL_BACKOFF_MAX,
-                    1.5 * (1.5 ** (attempt - 2)),
-                )
-                print(
-                    f"[ZmqExecutor] Waiting for RPC to index tokens — SELL Rust retry "
-                    f"{attempt}/{_RUST_SELL_ATTEMPTS} after {delay:.1f}s (avoiding Legacy)"
-                )
-                await asyncio.sleep(delay)
+                delay = _sell_retry_delay_sec(last_result)
+                if delay > 0:
+                    print(
+                        f"[ZmqExecutor] SELL Rust retry {attempt}/{_RUST_SELL_ATTEMPTS} "
+                        f"after {delay:.2f}s"
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    print(
+                        f"[ZmqExecutor] SELL Rust immediate retry {attempt}/{_RUST_SELL_ATTEMPTS}"
+                    )
 
             result = await self._send_signal(
                 "sell",

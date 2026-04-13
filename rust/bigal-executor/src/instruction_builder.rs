@@ -61,6 +61,11 @@ fn close_account_ix(account: &Pubkey, destination: &Pubkey, owner: &Pubkey) -> I
 //  Pump.fun instruction discriminators (Anchor)
 //  buy  = sha256("global:buy")[..8]
 //  sell = sha256("global:sell")[..8]
+//
+//  Cross-check account order + args against the official IDL any time the program
+//  upgrades: https://github.com/pump-fun/pump-public-docs/tree/main/idl
+//  Narrative spec: https://github.com/pump-fun/pump-public-docs/blob/main/docs/PUMP_PROGRAM_README.md
+//  Streaming (gRPC) references: repo root GRPC_RESOURCES.md
 // ─────────────────────────────────────────────
 
 const BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
@@ -326,22 +331,55 @@ impl InstructionBuilder {
 
         // ── Phase 1+2+3: Parallel RPC fetches with cache fast-paths ──
         //
-        // If cached_balance is available (from buy confirmation), skip the entire poll loop.
-        // If cached_blockhash is available (from rolling pre-fetch), skip the blockhash RPC call.
-        // Bonding curve fetch runs in parallel with whatever balance resolution we need.
+        // Cached buy estimate can overshoot actual ATA balance (rounding / curve drift) → reverts.
+        // Always parallel-fetch on-chain balance when cache hits; use real balance if indexed,
+        // else fall back to cache (RPC lag right after buy — second sell attempt polls).
         let (total_tokens, curve_state, recent_blockhash) = if let Some(cached) = cached_balance {
-            info!("SELL: using cached balance {} tokens (skipping poll loop)", cached);
-            // Cache hit: only need curve + optional blockhash
-            if let Some(bh) = cached_blockhash {
-                let curve_state = self.fetch_bonding_curve(&bonding_curve).await?;
-                (cached, curve_state, bh)
-            } else {
-                let (curve_result, bh_result) = tokio::join!(
+            let (curve_state, recent_blockhash, on_chain_res) = if let Some(bh) = cached_blockhash {
+                let (c, b) = tokio::join!(
                     self.fetch_bonding_curve(&bonding_curve),
-                    self.rpc.get_latest_blockhash()
+                    self.rpc_read.get_token_account_balance(&user_ata),
                 );
-                (cached, curve_result?, bh_result?)
+                (c?, bh, b)
+            } else {
+                let (c, bh, b) = tokio::join!(
+                    self.fetch_bonding_curve(&bonding_curve),
+                    self.rpc.get_latest_blockhash(),
+                    self.rpc_read.get_token_account_balance(&user_ata),
+                );
+                (c?, bh?, b)
+            };
+
+            let mut on_chain = match on_chain_res {
+                Ok(b) if b > 0 => b,
+                _ => 0,
+            };
+            if on_chain == 0 {
+                on_chain = self
+                    .rpc_read
+                    .get_token_balance_json_parsed(&user_ata)
+                    .await
+                    .unwrap_or(0);
             }
+
+            let total_tokens = if on_chain > 0 {
+                on_chain
+            } else {
+                info!(
+                    "SELL: on-chain balance 0 (lag) — using buy cache {} tokens",
+                    cached
+                );
+                cached
+            };
+
+            if on_chain > 0 {
+                info!(
+                    "SELL: buy cache {} vs on-chain {} → build with {} tokens",
+                    cached, on_chain, total_tokens
+                );
+            }
+
+            (total_tokens, curve_state, recent_blockhash)
         } else if let Some(bh) = cached_blockhash {
             // No balance cache, but have blockhash: parallel poll + curve only
             let (balance_result, curve_result) = tokio::join!(

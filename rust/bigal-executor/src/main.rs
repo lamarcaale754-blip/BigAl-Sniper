@@ -22,7 +22,7 @@ use blockhash_cache::{BlockhashCache, BlockhashHandle};
 use config::Config;
 use fee_estimator::FeeEstimator;
 use instruction_builder::InstructionBuilder;
-use jito_bundler::{JitoBundler, TipEstimator};
+use jito_bundler::{race_land_submit, JitoBundler, TipEstimator};
 use zmq_bridge::{LatencyInfo, Signal, TradeResult, ZmqBridge};
 
 use solana_sdk::signer::{keypair::Keypair, Signer};
@@ -147,9 +147,9 @@ async fn main() -> Result<()> {
 
     // Start gRPC observer (if configured)
     if let (Some(grpc_endpoint), Some(grpc_token)) = (&cfg.grpc_endpoint, &cfg.grpc_x_token) {
-        let grpc_pub = zmq_bridge::create_grpc_pub(cfg.zmq_grpc_port)
+        let grpc_pub = zmq_bridge::create_yellowstone_pub(&cfg.zmq_yellowstone_bind)
             .await
-            .context("Failed to create gRPC PUB socket")?;
+            .context("Failed to create Yellowstone ZMQ PUB socket")?;
         let grpc_pub = Arc::new(tokio::sync::Mutex::new(grpc_pub));
 
         let endpoint = grpc_endpoint.clone();
@@ -396,7 +396,7 @@ async fn handle_buy(
     let jito_fut = bundler.submit_bundle(vec![tx.clone()], tip, keypair, blockhash);
     let rpc_fut = JitoBundler::send_via_rpc(builder.rpc(), &tx);
 
-    match race_submit(jito_fut, rpc_fut).await {
+    match race_land_submit(jito_fut, rpc_fut, "jito", "rpc").await {
         Ok((sig_or_id, method)) => {
             let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
             let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
@@ -431,11 +431,20 @@ async fn handle_buy(
     }
 }
 
+/// Milliseconds to pause before a sell rebuild/reland after a failed attempt (RPC / blockhash settle).
+/// Set `BIGAL_SELL_RETRY_STAGGER_MS=0` to remove; default favors reliability over zero-gap retries.
+fn sell_retry_stagger_ms() -> u64 {
+    std::env::var("BIGAL_SELL_RETRY_STAGGER_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120)
+}
+
 /// Handle a sell signal.
 ///
 /// Tip tx uses the same recent blockhash as the signed sell (see [`InstructionBuilder::build_sell`]).
-/// Up to two full rebuild+land rounds for transient failures.
-/// Attempt 1 uses balance cache + blockhash cache; attempt 2 polls fresh.
+/// Up to three rebuild+land rounds; optional short stagger between attempts (see [`sell_retry_stagger_ms`]).
+/// Attempt 1 uses balance cache + blockhash cache; later attempts poll fresh.
 async fn handle_sell(
     builder: &InstructionBuilder,
     bundler: &JitoBundler,
@@ -454,13 +463,32 @@ async fn handle_sell(
         Err(e) => return TradeResult::failed(signal.id, format!("Invalid mint: {}", e)),
     };
 
-    let priority_fee = if signal.priority_fee_lamports > 0 {
+    let mut priority_fee = if signal.priority_fee_lamports > 0 {
         signal.priority_fee_lamports
     } else {
         fee_handle.load(Ordering::Relaxed)
     };
+    // Optional extra micro-lamports on urgent sells (default off = strategy/Python fee only).
+    if signal.priority == "urgent" {
+        let bps: u128 = std::env::var("BIGAL_SELL_PRIORITY_MULT_BPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
+        if bps > 0 && bps != 10_000 {
+            priority_fee = ((priority_fee as u128).saturating_mul(bps) / 10_000).min(u64::MAX as u128) as u64;
+        }
+    }
 
     let pct = signal.amount;
+
+    let sell_rpc_only = std::env::var("BIGAL_SELL_RPC_ONLY")
+        .map(|v| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
 
     let base_tip = if signal.priority_fee_lamports > 0 {
         signal.priority_fee_lamports
@@ -475,7 +503,7 @@ async fn handle_sell(
 
     let mut last_failure = String::new();
 
-    for attempt in 1..=2u8 {
+    for attempt in 1..=3u8 {
         let build_start = Instant::now();
 
         // Attempt 1: use balance cache + blockhash cache for maximum speed
@@ -493,12 +521,15 @@ async fn handle_sell(
         {
             Ok(x) => x,
             Err(e) => {
-                if attempt < 2 {
+                if attempt < 3 {
                     warn!(
                         "SELL build attempt {} failed: {}, retrying fresh (no cache)",
                         attempt, e
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    let ms = sell_retry_stagger_ms();
+                    if ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
                     continue;
                 }
                 return TradeResult::failed(signal.id, format!("Build failed: {}", e));
@@ -508,12 +539,18 @@ async fn handle_sell(
         let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
         let land_start = Instant::now();
 
-        // Phase 4: Race Jito bundle + direct RPC simultaneously.
-        // Same tx signature → Solana deduplicates. First success wins.
-        let jito_fut = bundler.submit_bundle(vec![tx.clone()], tip, keypair, tip_blockhash);
-        let rpc_fut = JitoBundler::send_via_rpc(builder.rpc(), &tx);
+        let land_result = if sell_rpc_only {
+            JitoBundler::send_via_rpc(builder.rpc(), &tx)
+                .await
+                .map(|sig| (sig, "rpc"))
+        } else {
+            // Race Jito bundle + direct RPC. Same tx signature → Solana deduplicates.
+            let jito_fut = bundler.submit_bundle(vec![tx.clone()], tip, keypair, tip_blockhash);
+            let rpc_fut = JitoBundler::send_via_rpc(builder.rpc(), &tx);
+            race_land_submit(jito_fut, rpc_fut, "jito", "rpc").await
+        };
 
-        match race_submit(jito_fut, rpc_fut).await {
+        match land_result {
             Ok((sig_or_id, method)) => {
                 let land_ms = land_start.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = recv_time.elapsed().as_secs_f64() * 1000.0;
@@ -543,8 +580,11 @@ async fn handle_sell(
             Err(e) => {
                 last_failure = format!("{}", e);
                 error!("SELL land failed attempt {} | {}", attempt, last_failure);
-                if attempt < 2 {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if attempt < 3 {
+                    let ms = sell_retry_stagger_ms();
+                    if ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
                     continue;
                 }
             }
@@ -559,46 +599,6 @@ async fn handle_sell(
             last_failure
         },
     )
-}
-
-/// Race Jito bundle submission against direct RPC submission.
-///
-/// Both paths submit the same signed transaction (same signature), so Solana
-/// validators deduplicate — no risk of double execution. Whichever path
-/// confirms first wins; if the winner fails, we await the loser.
-async fn race_submit(
-    jito_fut: impl std::future::Future<Output = Result<String>>,
-    rpc_fut: impl std::future::Future<Output = Result<String>>,
-) -> Result<(String, &'static str)> {
-    tokio::pin!(jito_fut);
-    tokio::pin!(rpc_fut);
-
-    tokio::select! {
-        jito_result = &mut jito_fut => {
-            match jito_result {
-                Ok(id) => Ok((id, "jito")),
-                Err(jito_err) => {
-                    warn!("Jito lost race ({}), awaiting RPC...", jito_err);
-                    match rpc_fut.await {
-                        Ok(sig) => Ok((sig, "rpc")),
-                        Err(rpc_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
-                    }
-                }
-            }
-        }
-        rpc_result = &mut rpc_fut => {
-            match rpc_result {
-                Ok(sig) => Ok((sig, "rpc")),
-                Err(rpc_err) => {
-                    warn!("RPC lost race ({}), awaiting Jito...", rpc_err);
-                    match jito_fut.await {
-                        Ok(id) => Ok((id, "jito")),
-                        Err(jito_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Handle a create-token signal (deploy new Pump.fun token)

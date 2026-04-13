@@ -12,6 +12,8 @@
  *   HELIUS_ENDPOINT      — Optional. LaserStream endpoint (default: US-East EWR).
  *   ZMQ_SIDECAR_ADDR     — Optional. ZMQ PUB address (default: ipc:///tmp/bigal_grpc_sidecar.ipc).
  *   ZMQ_SIDECAR_PORT     — Optional. TCP fallback port for Windows (default: 5558).
+ *
+ * Related: ../GRPC_RESOURCES.md (Yellowstone vs LaserStream vs Rust executor).
  */
 
 import { subscribe, CommitmentLevel } from "helius-laserstream";

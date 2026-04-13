@@ -4,12 +4,12 @@ use solana_sdk::{
 };
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::balance_cache::BalanceCache;
 use crate::blockhash_cache::{self, BlockhashHandle};
 use crate::instruction_builder::InstructionBuilder;
-use crate::jito_bundler::JitoBundler;
+use crate::jito_bundler::{race_land_submit, JitoBundler};
 use crate::zmq_bridge::{LatencyInfo, TradeResult};
 
 /// Execute an atomic rug pull via Jito bundle.
@@ -76,35 +76,8 @@ pub async fn execute_kill(
         tip_blockhash,
     );
     let rpc_fut = JitoBundler::send_via_rpc(builder.rpc(), &sell_tx);
-    tokio::pin!(jito_fut);
-    tokio::pin!(rpc_fut);
 
-    let submission_result: anyhow::Result<(String, &str)> = tokio::select! {
-        jito_result = &mut jito_fut => {
-            match jito_result {
-                Ok(id) => Ok((id, "jito_kill")),
-                Err(jito_err) => {
-                    warn!("Kill Jito failed ({}), awaiting RPC...", jito_err);
-                    match rpc_fut.await {
-                        Ok(sig) => Ok((sig, "rpc_kill")),
-                        Err(rpc_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
-                    }
-                }
-            }
-        }
-        rpc_result = &mut rpc_fut => {
-            match rpc_result {
-                Ok(sig) => Ok((sig, "rpc_kill")),
-                Err(rpc_err) => {
-                    warn!("Kill RPC failed ({}), awaiting Jito...", rpc_err);
-                    match jito_fut.await {
-                        Ok(id) => Ok((id, "jito_kill")),
-                        Err(jito_err) => Err(anyhow::anyhow!("jito: {} | rpc: {}", jito_err, rpc_err)),
-                    }
-                }
-            }
-        }
-    };
+    let submission_result = race_land_submit(jito_fut, rpc_fut, "jito_kill", "rpc_kill").await;
 
     match submission_result {
         Ok((sig_or_id, method)) => {

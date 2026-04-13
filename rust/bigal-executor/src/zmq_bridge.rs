@@ -196,14 +196,15 @@ impl ZmqBridge {
     }
 }
 
-/// Create a separate PUB socket for forwarding gRPC events to Python.
-pub async fn create_grpc_pub(port: u16) -> Result<PubSocket> {
-    let addr = format!("tcp://127.0.0.1:{}", port);
+/// Create a PUB socket for Yellowstone → Python (same JSON shape as `sidecar/sidecar_grpc.js`).
+/// Bind address: `ZMQ_YELLOWSTONE_IPC` (default `ipc:///tmp/bigal_yellowstone.ipc` on Unix) or
+/// `tcp://127.0.0.1:ZMQ_GRPC_PORT` on Windows — must match `grpc_zmq_listener` in bigalbot.
+pub async fn create_yellowstone_pub(bind_addr: &str) -> Result<PubSocket> {
     let mut pub_sock = PubSocket::new();
     pub_sock
-        .bind(&addr)
+        .bind(bind_addr)
         .await
-        .with_context(|| format!("Failed to bind gRPC PUB on {}", addr))?;
-    info!("gRPC forward PUB bound on {}", addr);
+        .with_context(|| format!("Failed to bind Yellowstone ZMQ PUB on {}", bind_addr))?;
+    info!("Yellowstone ZMQ PUB bound on {}", bind_addr);
     Ok(pub_sock)
 }

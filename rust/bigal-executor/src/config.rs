@@ -33,6 +33,9 @@ pub const DEFAULT_JITO_BUNDLE_URL: &str = "https://ny.mainnet.block-engine.jito.
 pub const DEFAULT_ZMQ_SIGNAL_IPC: &str = "ipc:///tmp/bigal_signal.ipc";
 pub const DEFAULT_ZMQ_RESULT_IPC: &str = "ipc:///tmp/bigal_result.ipc";
 
+/// Rust Yellowstone → Python SUB (must match `ZMQ_YELLOWSTONE_IPC` in bigalbot on Unix)
+pub const DEFAULT_ZMQ_YELLOWSTONE_IPC: &str = "ipc:///tmp/bigal_yellowstone.ipc";
+
 /// Default Jito tip (5000 lamports = 0.000005 SOL)
 pub const DEFAULT_JITO_TIP_LAMPORTS: u64 = 5_000_000; // 0.005 SOL
 
@@ -66,8 +69,11 @@ pub struct Config {
     /// ZMQ result port (Rust PUB → Python SUB)
     pub zmq_result_port: u16,
 
-    /// ZMQ gRPC forward port (Rust PUB → Python SUB for gRPC events)
+    /// ZMQ gRPC forward port (Rust PUB → Python SUB for gRPC events, Windows TCP fallback)
     pub zmq_grpc_port: u16,
+
+    /// Bind address for Rust Yellowstone PUB (`ZMQ_YELLOWSTONE_IPC` or Unix default IPC / Windows TCP)
+    pub zmq_yellowstone_bind: String,
 
     /// ZMQ signal endpoint (Rust PULL connects — Python PUSH binds here)
     pub zmq_signal_addr: String,
@@ -124,6 +130,17 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5557);
 
+        let zmq_yellowstone_bind = env::var("ZMQ_YELLOWSTONE_IPC").unwrap_or_else(|_| {
+            #[cfg(unix)]
+            {
+                DEFAULT_ZMQ_YELLOWSTONE_IPC.to_string()
+            }
+            #[cfg(not(unix))]
+            {
+                format!("tcp://127.0.0.1:{}", zmq_grpc_port)
+            }
+        });
+
         let (zmq_signal_addr, zmq_result_addr) = resolve_zmq_endpoints(zmq_signal_port, zmq_result_port);
 
         let pump_program_id = env::var("PUMP_FUN_PROGRAM_ID")
@@ -155,6 +172,7 @@ impl Config {
             zmq_signal_port,
             zmq_result_port,
             zmq_grpc_port,
+            zmq_yellowstone_bind,
             zmq_signal_addr,
             zmq_result_addr,
             pump_program_id,
