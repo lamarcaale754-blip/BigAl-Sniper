@@ -1451,10 +1451,11 @@ async def dashboard_handler(websocket):
     print(f"📊 Dashboard connected ({len(dashboard_clients)})")
     all_pos = {**positions, **moonbags}
     wsnap = await wallet_chain_snapshot()
+    _display_balance = wsnap.get("chain_balance") if (_tracks_live_wallet() and wsnap.get("chain_balance") is not None) else paper_balance
     await send_to_dashboard({
         "type": "snapshot",
         "data": {
-            "balance": paper_balance,
+            "balance": _display_balance,
             "pnl": realized_pnl,
             "projected_pnl": realized_pnl,
             "actual_wallet_pnl": _actual_wallet_pnl_from_snapshot(wsnap),
@@ -1738,10 +1739,11 @@ async def broadcast_stats():
     all_pos = {**positions, **moonbags}
     latency = executor.latency_dict() if executor else {"zmq_ms": 0, "build_ms": 0, "land_ms": 0, "total_ms": 0}
     wsnap = await wallet_chain_snapshot()
+    _display_balance = wsnap.get("chain_balance") if (_tracks_live_wallet() and wsnap.get("chain_balance") is not None) else paper_balance
     await send_to_dashboard({
         "type": "stats",
         "data": {
-            "balance": round(paper_balance, 6),
+            "balance": round(_display_balance, 6),
             "pnl": round(realized_pnl, 6),
             "projected_pnl": round(realized_pnl, 6),
             "actual_wallet_pnl": _actual_wallet_pnl_from_snapshot(wsnap),
