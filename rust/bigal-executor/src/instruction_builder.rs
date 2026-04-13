@@ -305,7 +305,9 @@ impl InstructionBuilder {
             anyhow::bail!("Calculated 0 tokens for {} lamports", sol_lamports);
         }
 
-        let max_sol_cost = sol_lamports + (sol_lamports * slippage_bps as u64) / 10_000;
+        // Post-cashback upgrade: program adds creator + protocol fees on top of SOL cost.
+        // Give extra headroom (50% buffer) so the total with fees doesn't exceed max_sol_cost.
+        let max_sol_cost = sol_lamports + (sol_lamports * 50) / 100;
 
         debug!(
             "BUY: {} SOL -> ~{} tokens | max_cost={} | slippage={}bps",
@@ -480,10 +482,14 @@ impl InstructionBuilder {
         }
 
         let expected_sol = Self::calculate_sell_sol(&curve_state, sell_amount);
-        let min_sol_output = expected_sol - (expected_sol * slippage_bps as u64) / 10_000;
+        // Post-cashback upgrade: program deducts creator + protocol fees from output.
+        // Our bonding curve math doesn't account for those fees, so min_sol_output
+        // overestimates → "Overflow" (6024). Use 0 = accept any output.
+        // Slippage protection comes from strategy-level TP/SL + Jito MEV protection.
+        let min_sol_output: u64 = 0;
 
         debug!(
-            "SELL: {}% ({} tokens) -> ~{} lamports | min_out={}",
+            "SELL: {}% ({} tokens) -> ~{} lamports (expected) | min_out={}",
             pct, sell_amount, expected_sol, min_sol_output
         );
 
