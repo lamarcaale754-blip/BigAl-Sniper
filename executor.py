@@ -34,9 +34,12 @@ DEFAULT_ZMQ_SIGNAL_IPC = "ipc:///tmp/bigal_signal.ipc"
 DEFAULT_ZMQ_RESULT_IPC = "ipc:///tmp/bigal_result.ipc"
 
 # Rust sell attempts before Legacy (each attempt is a full ZMQ round-trip).
-_RUST_SELL_ATTEMPTS = max(1, int(os.environ.get("ZMQ_SELL_RUST_ATTEMPTS", "8")))
-_RUST_SELL_BACKOFF_MAX = float(os.environ.get("ZMQ_SELL_BACKOFF_MAX", "6.0"))
-_ZMQ_SELL_WAIT_SEC = float(os.environ.get("ZMQ_SELL_WAIT_SEC", "90"))
+# Reduced defaults: Rust now handles balance caching, parallel fetches, and dual
+# Jito+RPC submission internally, so Python needs far fewer retries.
+# Override via env vars if needed (e.g. ZMQ_SELL_RUST_ATTEMPTS=8 for old behavior).
+_RUST_SELL_ATTEMPTS = max(1, int(os.environ.get("ZMQ_SELL_RUST_ATTEMPTS", "3")))
+_RUST_SELL_BACKOFF_MAX = float(os.environ.get("ZMQ_SELL_BACKOFF_MAX", "2.0"))
+_ZMQ_SELL_WAIT_SEC = float(os.environ.get("ZMQ_SELL_WAIT_SEC", "15"))
 _ZMQ_SELL_PREFLIGHT_MS = max(0, int(os.environ.get("ZMQ_SELL_PREFLIGHT_MS", "0")))
 
 
