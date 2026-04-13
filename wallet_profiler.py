@@ -9,10 +9,13 @@ Part of BigAl Auto Rug Puller pipeline.
 """
 
 import time
+import asyncio
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Callable, Tuple
+
+from profiler_db import init_profiler_db, upsert_flagged_bot
 
 
 # =====================================================
@@ -230,6 +233,37 @@ class WalletProfile:
             return "SUSPECTED"
         return "SCORING"
 
+    def estimated_win_rate(self) -> float:
+        """
+        Heuristic win rate from realized sell-vs-buy performance per token.
+        """
+        buys_by_token: Dict[str, List[float]] = defaultdict(list)
+        sells_by_token: Dict[str, List[float]] = defaultdict(list)
+        for t in self.trades:
+            if t.price <= 0:
+                continue
+            if t.tx_type == "buy":
+                buys_by_token[t.token_mint].append(t.price)
+            elif t.tx_type == "sell":
+                sells_by_token[t.token_mint].append(t.price)
+
+        evaluated = 0
+        wins = 0
+        for mint, sell_prices in sells_by_token.items():
+            buy_prices = buys_by_token.get(mint)
+            if not buy_prices:
+                continue
+            avg_buy = statistics.mean(buy_prices)
+            avg_sell = statistics.mean(sell_prices)
+            if avg_buy <= 0:
+                continue
+            evaluated += 1
+            if avg_sell > avg_buy:
+                wins += 1
+        if evaluated == 0:
+            return 0.0
+        return wins / float(evaluated)
+
     def to_dashboard_dict(
         self,
         now: Optional[float] = None,
@@ -325,6 +359,8 @@ class WalletProfiler:
 
         # Sybil detection — co-occurrence graph
         self.sybil_detector = SybilDetector()
+        self._db_write_tasks: Set[asyncio.Task] = set()
+        init_profiler_db()
 
     # ──────────────────────────────────────────────
     #  EVENT HANDLERS (called from main bot loop)
@@ -482,10 +518,36 @@ class WalletProfiler:
             profile = self.profiles.get(wallet)
             if profile and len(profile.buy_trades) >= self.min_trades:
                 profile.compute_bot_score()
+                self._persist_profitable_bot(profile)
         self._dirty_wallets.clear()
 
         # Phase 4: Proactive decay
         self._decay_stale()
+
+    def _persist_profitable_bot(self, profile: WalletProfile) -> None:
+        win_rate = profile.estimated_win_rate()
+        confidence = float(profile._bot_score) / 100.0
+        if confidence < 0.60 or win_rate < 0.60:
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(
+                asyncio.to_thread(
+                    upsert_flagged_bot,
+                    profile.wallet,
+                    round(confidence, 4),
+                    round(win_rate, 4),
+                )
+            )
+            self._db_write_tasks.add(task)
+            task.add_done_callback(self._db_write_tasks.discard)
+        except RuntimeError:
+            upsert_flagged_bot(
+                profile.wallet,
+                round(confidence, 4),
+                round(win_rate, 4),
+            )
 
     def _detect_tight_clusters(self) -> Set[str]:
         """

@@ -285,40 +285,50 @@ class PuppetMaster:
             await _update()
 
             sorted_buys = sorted(plan.puppet_buys, key=lambda b: b.delay_sec)
-            start_time = time.time()
+            swarm_lock = asyncio.Lock()
+            swarm_start = time.time()
 
-            for buy in sorted_buys:
-                # Wait until the scheduled delay
-                elapsed = time.time() - start_time
-                wait = max(0, buy.delay_sec - elapsed)
-                if wait > 0:
-                    await asyncio.sleep(wait)
-
+            async def _staggered_puppet_buy(buy) -> bool:
                 puppet = state.puppets[buy.wallet_index]
+                randomized_size = max(0.0001, buy.sol_amount * random.uniform(0.9, 1.1))
+                planned_wait = max(0.0, float(buy.delay_sec) - (time.time() - swarm_start))
+                jitter = random.uniform(0.05, 0.60)
+                await asyncio.sleep(planned_wait + jitter)
 
+                success = False
                 if self.is_live and self._executor:
-                    # Real buy via executor — sign with puppet's keypair
-                    puppet_b58 = base58.b58encode(bytes(puppet.keypair)).decode()
-                    sig = await self._executor.buy(
-                        state.token_mint, buy.sol_amount, 15, 0.003,
-                        keypair_b58=puppet_b58,
-                    )
-                    if sig:
-                        puppet.buys_executed += 1
-                        puppet.total_spent_sol += buy.sol_amount
-                        state.sol_in_pool += buy.sol_amount
+                    try:
+                        puppet_b58 = base58.b58encode(bytes(puppet.keypair)).decode()
+                        sig = await self._executor.buy(
+                            state.token_mint, randomized_size, 15, 0.003,
+                            keypair_b58=puppet_b58,
+                        )
+                        success = bool(sig)
+                    except Exception as e:
+                        print(f"[PuppetMaster] Puppet buy failed {puppet.index}: {e}")
+                        success = False
                 else:
-                    # Simulated
-                    puppet.buys_executed += 1
-                    puppet.total_spent_sol += buy.sol_amount
-                    state.sol_in_pool += buy.sol_amount
+                    success = True
 
-                state.buys_completed += 1
-                # Add jitter to look human
-                await asyncio.sleep(random.uniform(0.1, 0.5))
-                await _update()
-                print(f"[PuppetMaster] Buy {state.buys_completed}/{state.buys_total} "
-                      f"| puppet {puppet.index} | {buy.sol_amount:.4f} SOL")
+                async with swarm_lock:
+                    state.buys_completed += 1
+                    if success:
+                        puppet.buys_executed += 1
+                        puppet.total_spent_sol += randomized_size
+                        state.sol_in_pool += randomized_size
+                    await _update()
+                    print(
+                        f"[PuppetMaster] Buy {state.buys_completed}/{state.buys_total} "
+                        f"| puppet {puppet.index} | {randomized_size:.4f} SOL"
+                    )
+                return success
+
+            swarm_results = await asyncio.gather(
+                *[_staggered_puppet_buy(buy) for buy in sorted_buys],
+                return_exceptions=True,
+            )
+            swarm_success = sum(1 for r in swarm_results if r is True)
+            print(f"[PuppetMaster] Swarm complete: {swarm_success}/{len(sorted_buys)} successful")
 
             # ── Step 5: Watch for target bot ──
             state.status = "watching"

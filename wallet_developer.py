@@ -9,16 +9,18 @@ Each wallet must reach ~5 minutes of age and complete a few randomized
 from __future__ import annotations
 
 import asyncio
+import base64
 import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+import aiohttp
 from solders.keypair import Keypair
 from solders.message import Message
 from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
-from solders.transaction import Transaction
+from solders.transaction import Transaction, VersionedTransaction
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Processed
 from solana.rpc.types import TxOpts
@@ -30,6 +32,8 @@ TARGET_MICRO_TXS = 3
 # Randomized spacing between micro-actions (seconds)
 MICRO_INTERVAL_MIN = 25.0
 MICRO_INTERVAL_MAX = 90.0
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 
 @dataclass
@@ -194,6 +198,51 @@ class WalletDeveloper:
         except Exception:
             return False
 
+    async def _micro_jupiter_swap(self, wallet_kp: Keypair, amount_lamports: int = MICRO_LAMPORTS) -> bool:
+        quote_url = (
+            "https://quote-api.jup.ag/v6/quote"
+            f"?inputMint={WSOL_MINT}&outputMint={USDC_MINT}"
+            f"&amount={int(amount_lamports)}&slippageBps=50"
+        )
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(quote_url) as quote_resp:
+                    if quote_resp.status != 200:
+                        return False
+                    quote_data = await quote_resp.json()
+
+                swap_payload = {
+                    "quoteResponse": quote_data,
+                    "userPublicKey": str(wallet_kp.pubkey()),
+                    "wrapAndUnwrapSol": True,
+                    "dynamicComputeUnitLimit": True,
+                    "prioritizationFeeLamports": 50_000,
+                }
+                async with session.post("https://quote-api.jup.ag/v6/swap", json=swap_payload) as swap_resp:
+                    if swap_resp.status != 200:
+                        return False
+                    swap_json = await swap_resp.json()
+        except Exception:
+            return False
+
+        tx_b64 = swap_json.get("swapTransaction")
+        if not tx_b64:
+            return False
+
+        try:
+            raw_tx = base64.b64decode(tx_b64)
+            unsigned_tx = VersionedTransaction.from_bytes(raw_tx)
+            signed_tx = VersionedTransaction(unsigned_tx.message, [wallet_kp])
+            client = await self._ensure_client()
+            await client.send_raw_transaction(
+                bytes(signed_tx),
+                opts=TxOpts(skip_preflight=True, preflight_commitment=Processed, max_retries=2),
+            )
+            return True
+        except Exception:
+            return False
+
     async def _bootstrap_pool(self, client: AsyncClient) -> None:
         async with self._lock:
             if self._pool:
@@ -216,9 +265,20 @@ class WalletDeveloper:
         if not others:
             return
         b = random.choice(others)
-        mode = random.choice(["transfer", "transfer", "bounce"])
+        mode = random.choice(["swap", "transfer", "bounce"])
         ok = False
-        if mode == "bounce":
+        used_swap_fallback_transfer = False
+        if mode == "swap":
+            ok = await self._micro_jupiter_swap(a.keypair)
+            if ok:
+                a.micro_tx_count += 1
+                a.last_micro_at = time.time()
+                a.last_error = ""
+            else:
+                # Keep existing transfer warmup path as resilient fallback.
+                ok = await self._micro_transfer(client, a.keypair, b.keypair.pubkey())
+                used_swap_fallback_transfer = bool(ok)
+        elif mode == "bounce":
             ok = await self._micro_transfer(client, a.keypair, b.keypair.pubkey())
             if ok:
                 await asyncio.sleep(1.0)
@@ -226,8 +286,9 @@ class WalletDeveloper:
         else:
             ok = await self._micro_transfer(client, a.keypair, b.keypair.pubkey())
         if ok:
-            a.micro_tx_count += 1
-            a.last_micro_at = time.time()
+            if mode != "swap" or used_swap_fallback_transfer:
+                a.micro_tx_count += 1
+                a.last_micro_at = time.time()
             if mode == "bounce":
                 b.micro_tx_count += 1
                 b.last_micro_at = time.time()
