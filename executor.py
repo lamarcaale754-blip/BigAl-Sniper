@@ -11,12 +11,13 @@ Rust reads `ZMQ_SIGNAL_IPC` / `ZMQ_RESULT_IPC` for the same paths on Unix.
 Set `JITO_BLOCK_ENGINE` to the NY (US East) Jito URL for `us-east-1` hosts.
 
 Sell path tuning (ghost balance / RPC lag):
-  ZMQ_SELL_RUST_ATTEMPTS — Python↔Rust sell retries before Legacy (default 8).
-  ZMQ_SELL_BACKOFF_MAX — max seconds between those retries (default 6.0).
-Rust executor: HELIUS_READ_RPC_URL — same paid Helius HTTP URL as buys for token balance polls;
-  BIGAL_SELL_BALANCE_RETRIES / BIGAL_SELL_BALANCE_POLL_MS — patience inside each Rust sell build.
-  ZMQ_SELL_WAIT_SEC — max wait per Rust sell build (default 90; must exceed internal balance polling).
-  ZMQ_SELL_PREFLIGHT_MS — optional sleep before first sell attempt (default 0) to reduce RPC indexing races.
+  ZMQ_SELL_RUST_ATTEMPTS — Python↔Rust sell retries before Legacy (default 3).
+  ZMQ_SELL_BACKOFF_MAX — max seconds between those retries (default 2.0).
+Rust executor: balance cache from buy + parallel RPC + dual Jito+RPC racing handle most latency.
+  HELIUS_READ_RPC_URL — dedicated Helius HTTP URL for token balance polls.
+  BIGAL_SELL_BALANCE_RETRIES / BIGAL_SELL_BALANCE_POLL_MS — fallback patience when cache misses (defaults 20 / 200ms).
+  ZMQ_SELL_WAIT_SEC — max wait per Rust sell build (default 15).
+  ZMQ_SELL_PREFLIGHT_MS — optional sleep before first sell attempt (default 0).
 """
 
 import asyncio

@@ -222,6 +222,7 @@ impl InstructionBuilder {
         sol_amount: f64,
         slippage_bps: u16,
         priority_fee: u64,
+        cached_blockhash: Option<Hash>,
     ) -> Result<(Transaction, u64)> {
         let user = keypair.pubkey();
         let sol_lamports = (sol_amount * 1e9) as u64;
@@ -283,7 +284,10 @@ impl InstructionBuilder {
         let compute_limit_ix = compute_unit_limit_ix(200_000);
         let compute_price_ix = compute_unit_price_ix(priority_fee);
 
-        let recent_blockhash = self.rpc.get_latest_blockhash().await?;
+        let recent_blockhash = match cached_blockhash {
+            Some(bh) => bh,
+            None => self.rpc.get_latest_blockhash().await?,
+        };
 
         let message = Message::new(
             &[compute_limit_ix, compute_price_ix, create_ata_ix, buy_ix],

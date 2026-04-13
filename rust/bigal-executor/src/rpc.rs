@@ -144,8 +144,11 @@ impl RpcClient {
             .ok_or_else(|| anyhow::anyhow!("Invalid balance response"))
     }
 
-    /// Send a signed transaction and wait for confirmation
-    pub async fn send_and_confirm_transaction(&self, tx: &Transaction) -> Result<String> {
+    /// Broadcast a signed transaction via `sendTransaction` (skipPreflight, maxRetries=3).
+    ///
+    /// Returns the signature on RPC acceptance. This does **not** poll for
+    /// confirmation — the name is kept short for call-site readability.
+    pub async fn send_transaction(&self, tx: &Transaction) -> Result<String> {
         let tx_bytes = bincode::serialize(tx)
             .context("Failed to serialize transaction")?;
         let encoded = bs58::encode(&tx_bytes).into_string();

@@ -301,7 +301,7 @@ impl JitoBundler {
         rpc: &crate::rpc::RpcClient,
         tx: &Transaction,
     ) -> Result<String> {
-        rpc.send_and_confirm_transaction(tx).await
+        rpc.send_transaction(tx).await
             .context("RPC send_and_confirm failed")
     }
 }

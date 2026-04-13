@@ -359,9 +359,12 @@ async fn handle_buy(
     };
     let build_start = Instant::now();
 
+    // Read cached blockhash for both build_buy (signing) and Jito tip tx
+    let cached_bh = blockhash_cache::read_cached_blockhash(blockhash_handle, 30).await;
+
     // Build buy transaction — returns (tx, expected_tokens) for balance cache
     let (tx, tokens_out) = match builder
-        .build_buy(keypair, &mint, signal.amount, signal.slippage_bps, priority_fee)
+        .build_buy(keypair, &mint, signal.amount, signal.slippage_bps, priority_fee, cached_bh)
         .await
     {
         Ok(pair) => pair,
@@ -371,8 +374,8 @@ async fn handle_buy(
     let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
     let land_start = Instant::now();
 
-    // Use cached blockhash for Jito tip tx, fall back to fresh fetch
-    let blockhash = match blockhash_cache::read_cached_blockhash(blockhash_handle, 30).await {
+    // Tip tx blockhash: reuse cached or fetch fresh
+    let blockhash = match cached_bh {
         Some(bh) => bh,
         None => match builder.rpc().get_latest_blockhash().await {
             Ok(bh) => bh,
