@@ -440,10 +440,15 @@
   <div class="hdr-right">
     <div class="stats-dd-wrap">
       <button type="button" class="stats-dd-btn" id="statsDdBtn" onclick="toggleStatsDropdown(event)">Stats ▾</button>
-      <div id="statsDropdown" class="stats-dropdown hidden">
+      <div id="statsDropdown" class="stats-dropdown hidden" style="width:320px">
         <div class="stats-dd-row"><span style="color:var(--muted)">Balance (model)</span><span id="ddBalance" class="mono">-- SOL</span></div>
-        <div class="stats-dd-row"><span style="color:var(--muted)">Cumulative PnL (model)</span><span id="ddPnl" class="mono">--</span></div>
+        <div class="stats-dd-row"><span style="color:var(--muted)">Projected PnL</span><span id="ddPnl" class="mono">--</span></div>
+        <div class="stats-dd-row"><span style="color:var(--muted)">Actual PnL (chain)</span><span id="ddActualPnl" class="mono" style="color:var(--dim)">--</span></div>
         <div class="stats-dd-row"><span style="color:var(--muted)">Wallet Δ (chain)</span><span id="ddWalletDelta" class="mono" title="On-chain SOL change vs session start; includes fees">--</span></div>
+        <div style="border-top:1px solid var(--bdr);margin:6px 0;padding-top:6px">
+          <div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Execution Counters</div>
+          <div id="ddCounters" style="font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--dim)">--</div>
+        </div>
         <div class="stats-dd-chart"><canvas id="statsMiniChart"></canvas></div>
       </div>
     </div>
@@ -467,8 +472,8 @@
 <!-- STATS BAR (Sniper) -->
 <div class="stats" id="sniperStats">
   <div class="stat"><div class="stat-l">Balance</div><div class="stat-v" id="sBalance" style="color:var(--bright)">--<span class="stat-u">SOL</span></div></div>
-  <div class="stat"><div class="stat-l">PnL</div><div class="stat-v" id="sPnl">--<span class="stat-u">SOL</span></div></div>
-  <div class="stat" id="walletDeltaStat" style="display:none" title="On-chain SOL change since live session started (fees, tips, slippage included)"><div class="stat-l">Wallet Δ</div><div class="stat-v" id="sWalletDelta">--<span class="stat-u">SOL</span></div></div>
+  <div class="stat" title="Strategy-model projected PnL"><div class="stat-l">Projected PnL</div><div class="stat-v" id="sPnl">--<span class="stat-u">SOL</span></div></div>
+  <div class="stat" id="walletDeltaStat" title="Actual on-chain SOL change (fees, tips, slippage included)"><div class="stat-l">Actual PnL</div><div class="stat-v" id="sWalletDelta">--<span class="stat-u">SOL</span></div></div>
   <div class="stat"><div class="stat-l">Win Rate</div><div class="stat-v" id="sWR">--<span class="stat-u">%</span></div></div>
   <div class="stat"><div class="stat-l">W / L</div><div class="stat-v" id="sWL" style="color:var(--bright)">--</div></div>
   <div class="stat"><div class="stat-l">Positions</div><div class="stat-v" id="sPos" style="color:var(--bright)">0</div></div>
@@ -1387,12 +1392,40 @@ function updateStats(d){
   const wdEl=$('sWalletDelta');
   const wdStat=document.getElementById('walletDeltaStat');
   if(wdEl&&wdStat){
-    if(d.wallet_delta_sol!==undefined&&d.wallet_delta_sol!==null&&!Number.isNaN(d.wallet_delta_sol)){
+    const awp=d.actual_wallet_pnl!==undefined?d.actual_wallet_pnl:d.wallet_delta_sol;
+    if(awp!==undefined&&awp!==null&&!Number.isNaN(awp)){
       wdStat.style.display='';
-      wdEl.innerHTML=`${d.wallet_delta_sol>=0?'+':''}${d.wallet_delta_sol.toFixed(4)}<span class="stat-u">SOL</span>`;
-      wdEl.style.color=d.wallet_delta_sol>=0?'var(--green)':'var(--red)';
-    }else{wdStat.style.display='none';}
+      wdEl.innerHTML=`${awp>=0?'+':''}${awp.toFixed(4)}<span class="stat-u">SOL</span>`;
+      wdEl.style.color=awp>=0?'var(--green)':'var(--red)';
+    }else{
+      wdStat.style.display='';
+      wdEl.innerHTML=`--<span class="stat-u">SOL</span>`;
+      wdEl.style.color='var(--dim)';
+    }
   }
+  // Actual PnL in dropdown
+  const ddAP=document.getElementById('ddActualPnl');
+  if(ddAP){
+    const awp=d.actual_wallet_pnl;
+    if(awp!==undefined&&awp!==null&&!Number.isNaN(awp)){
+      ddAP.textContent=`${awp>=0?'+':''}${awp.toFixed(4)} SOL`;
+      ddAP.style.color=awp>=0?'var(--green)':'var(--red)';
+    }else{ddAP.textContent='--';ddAP.style.color='var(--dim)';}
+  }
+
+  // Execution counters in dropdown
+  const ddC=document.getElementById('ddCounters');
+  if(ddC&&d.execution_counters){
+    const ec=d.execution_counters;
+    const entries=Object.entries(ec).filter(([,v])=>v>0);
+    if(entries.length){
+      ddC.innerHTML=entries.map(([k,v])=>{
+        const col=k.includes('failed')?'var(--red)':k.includes('skip')?'var(--orange)':'var(--dim)';
+        return `<div style="display:flex;justify-content:space-between;margin-bottom:2px"><span style="color:var(--muted)">${k.replace(/_/g,' ')}</span><span style="color:${col};font-weight:600">${v}</span></div>`;
+      }).join('');
+    }else{ddC.textContent='all clear';}
+  }
+
   if(statsMiniChart&&chartVals.length){
     statsMiniChart.data.labels=chartLabels.slice(-40);
     statsMiniChart.data.datasets[0].data=chartVals.slice(-40);
@@ -1450,7 +1483,11 @@ function renderTrades(){
   document.getElementById('tradeCount').textContent=trades.length;
   document.getElementById('tBody').innerHTML=trades.slice(0,40).map(t=>{
     const w=t.pnl_pct>=0,c=w?'var(--green)':'var(--red)',b=w?'badge-w':'badge-l';
-    return `<tr><td style="color:var(--dim);font-size:10px">${t.time}</td><td style="color:var(--bright)">${t.symbol}</td><td style="color:${c};font-weight:600">${w?'+':''}${t.pnl_pct.toFixed(1)}%</td><td style="color:${c}">${w?'+':''}${t.pnl_sol.toFixed(4)}</td><td style="color:var(--dim)">${t.hold_time}s</td><td><span class="badge ${b}">${t.reason}</span></td></tr>`;
+    const cm=t.execution_confirmed?'&#x2705; ':'';
+    const solCol=t.actual_wallet_pnl!==undefined&&t.actual_wallet_pnl!==null?
+      `<span title="projected: ${(t.projected_pnl_sol||t.pnl_sol).toFixed(4)}">${t.actual_wallet_pnl>=0?'+':''}${t.actual_wallet_pnl.toFixed(4)}</span>`:
+      `${w?'+':''}${t.pnl_sol.toFixed(4)}`;
+    return `<tr><td style="color:var(--dim);font-size:10px">${t.time}</td><td style="color:var(--bright)">${cm}${t.symbol}</td><td style="color:${c};font-weight:600">${w?'+':''}${t.pnl_pct.toFixed(1)}%</td><td style="color:${c}">${solCol}</td><td style="color:var(--dim)">${t.hold_time}s</td><td><span class="badge ${b}">${t.reason}</span></td></tr>`;
   }).join('');
 }
 
