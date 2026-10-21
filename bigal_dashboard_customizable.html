@@ -69,10 +69,6 @@
   .pause-btn:hover{background:rgba(0,230,118,.14);border-color:rgba(0,230,118,.4)}
   .pause-btn.paused{background:rgba(255,145,0,.1);border-color:rgba(255,145,0,.3);color:var(--orange)}
   .pause-btn.paused:hover{background:rgba(255,145,0,.18);border-color:rgba(255,145,0,.45)}
-  .win-sound-btn{display:inline-flex;align-items:center;gap:4px;background:rgba(0,191,165,.08);border:1px solid rgba(0,191,165,.28);color:var(--cyan);border-radius:4px;padding:3px 8px;font-size:10px;font-family:'JetBrains Mono',monospace;font-weight:600;cursor:pointer;transition:all .15s;letter-spacing:.2px;max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .win-sound-btn:hover{background:rgba(0,191,165,.14);border-color:rgba(0,191,165,.42)}
-  .win-sound-btn.win-sound-off{background:#0a0c10;border-color:var(--bdr);color:var(--muted)}
-  .win-sound-btn.win-sound-off:hover{border-color:var(--bdr2);color:var(--dim)}
   .cfg-env-banner{font-size:10px;color:var(--dim);line-height:1.5;background:#0a1218;border:1px solid var(--bdr);border-radius:8px;padding:10px 12px;margin-bottom:12px;max-height:200px;overflow-y:auto}
   .cfg-env-banner strong{color:var(--cyan);font-weight:600}
   .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:4px}
@@ -422,12 +418,6 @@
   </div>
 </div>
 
-<audio id="rustWinAudio" preload="auto" playsinline>
-  <source src="assets/sounds/rust-win-celebration.mp3" type="audio/mpeg">
-</audio>
-<audio id="rustLossAudio" preload="auto" playsinline>
-  <source src="assets/sounds/rust-loss-hallelujah.mp3" type="audio/mpeg">
-</audio>
 <!-- HEADER -->
 <div class="hdr">
   <div class="hdr-left">
@@ -462,8 +452,6 @@
       <span class="lat-chip lat-total"><span class="lat-label">TOTAL</span><span class="lat-val" id="latTotal">--</span><span class="lat-unit">ms</span></span>
     </div>
     <div><span class="dot off" id="dot"></span><span id="statusLbl">CONNECTING</span></div>
-    <button type="button" class="win-sound-btn" id="winSoundBtn" onclick="toggleWinSound()" title="Rust mode: celebration audio ~30s on trades with PnL over 10% (one burst; interrupts loss clip)">Win sound: on</button>
-    <button type="button" class="win-sound-btn" id="lossSoundBtn" onclick="toggleLossSound()" title="Rust mode: loss audio ~20s on negative-PnL exits (one burst; interrupts win clip)">Loss sound: on</button>
     <button type="button" class="pause-btn" id="pauseBtn" onclick="togglePause()" title="Pause/Resume new entries"><span id="pauseIcon">▶</span> <span id="pauseLbl">ACTIVE</span></button>
     <span id="modeLbl" class="mode-lbl-btn" onclick="openModeSwitch()" title="Click to change mode">--</span>
   </div>
@@ -836,12 +824,6 @@ let rugAutoApproveSessionOk = false;
 let tradingPaused = false;
 let lastExecutorType = 'paper';
 let startupHints = {};
-const RUST_WIN_SOUND_LS = 'bigal_rust_win_sound';
-const RUST_LOSS_SOUND_LS = 'bigal_rust_loss_sound';
-const RUST_TRADE_WIN_MS = 30000;
-const RUST_TRADE_LOSS_MS = 20000;
-let _activeTradeSound = null;
-let _tradeSoundEndTimer = null;
 
 // ---- Startup Modal ----
 
@@ -1480,8 +1462,6 @@ const _throttledRenderBots = throttle(function(data){ renderBotTable(data); }, 2
 
 function addTrade(t){
   trades.unshift(t);if(trades.length>80)trades.length=80;
-  tryRustWinSound(t);
-  tryRustLossSound(t);
   chartLabels.push(t.time);chartVals.push(t.cum_pnl);
   if(chartLabels.length>80){chartLabels.shift();chartVals.shift();}
   if(pnlChart){
@@ -1519,83 +1499,6 @@ function addLog(d){
   el.scrollTop=el.scrollHeight;
 }
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-
-function isRustWinSoundEnabled(){
-  try { return localStorage.getItem(RUST_WIN_SOUND_LS) !== '0'; } catch (_) { return true; }
-}
-function isRustLossSoundEnabled(){
-  try { return localStorage.getItem(RUST_LOSS_SOUND_LS) !== '0'; } catch (_) { return true; }
-}
-function setRustWinSoundEnabled(on){
-  try { localStorage.setItem(RUST_WIN_SOUND_LS, on ? '1' : '0'); } catch (_) {}
-  updateWinSoundToggleUI();
-}
-function setRustLossSoundEnabled(on){
-  try { localStorage.setItem(RUST_LOSS_SOUND_LS, on ? '1' : '0'); } catch (_) {}
-  updateLossSoundToggleUI();
-}
-function updateWinSoundToggleUI(){
-  const btn = document.getElementById('winSoundBtn');
-  if (!btn) return;
-  const on = isRustWinSoundEnabled();
-  btn.textContent = on ? 'Win sound: on' : 'Win sound: off';
-  btn.classList.toggle('win-sound-off', !on);
-}
-function updateLossSoundToggleUI(){
-  const btn = document.getElementById('lossSoundBtn');
-  if (!btn) return;
-  const on = isRustLossSoundEnabled();
-  btn.textContent = on ? 'Loss sound: on' : 'Loss sound: off';
-  btn.classList.toggle('win-sound-off', !on);
-}
-function stopAllRustTradeSounds(){
-  const w = document.getElementById('rustWinAudio');
-  const l = document.getElementById('rustLossAudio');
-  if (w) { try { w.pause(); w.currentTime = 0; } catch (_) {} }
-  if (l) { try { l.pause(); l.currentTime = 0; } catch (_) {} }
-  if (_tradeSoundEndTimer) { clearTimeout(_tradeSoundEndTimer); _tradeSoundEndTimer = null; }
-  _activeTradeSound = null;
-}
-function startRustTradeClip(kind, el, durationMs){
-  if (!el) return;
-  stopAllRustTradeSounds();
-  _activeTradeSound = kind;
-  el.currentTime = 0;
-  el.play().catch(function () {});
-  _tradeSoundEndTimer = setTimeout(function () {
-    stopAllRustTradeSounds();
-  }, durationMs);
-}
-function tryRustWinSound(t){
-  if (!t || lastExecutorType !== 'zmq_rust') return;
-  if (!isRustWinSoundEnabled()) return;
-  const pct = Number(t.pnl_pct);
-  if (Number.isNaN(pct) || pct <= 10) return;
-  if (_activeTradeSound === 'win') return;
-  const a = document.getElementById('rustWinAudio');
-  if (!a) return;
-  startRustTradeClip('win', a, RUST_TRADE_WIN_MS);
-}
-function tryRustLossSound(t){
-  if (!t || lastExecutorType !== 'zmq_rust') return;
-  if (!isRustLossSoundEnabled()) return;
-  const pct = Number(t.pnl_pct);
-  if (Number.isNaN(pct) || pct >= 0) return;
-  if (_activeTradeSound === 'loss') return;
-  const a = document.getElementById('rustLossAudio');
-  if (!a) return;
-  startRustTradeClip('loss', a, RUST_TRADE_LOSS_MS);
-}
-function toggleWinSound(){
-  const next = !isRustWinSoundEnabled();
-  setRustWinSoundEnabled(next);
-  if (!next && _activeTradeSound === 'win') stopAllRustTradeSounds();
-}
-function toggleLossSound(){
-  const next = !isRustLossSoundEnabled();
-  setRustLossSoundEnabled(next);
-  if (!next && _activeTradeSound === 'loss') stopAllRustTradeSounds();
-}
 
 function setConn(on){
   document.getElementById('dot').className=`dot ${on?'on':'off'}`;
@@ -2281,8 +2184,6 @@ function ts(){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-
 window.addEventListener('DOMContentLoaded',()=>{
   initChart();
   buildSliders();
-  updateWinSoundToggleUI();
-  updateLossSoundToggleUI();
   const rThr = document.getElementById('rugAutoPlanThr');
   const rAge = document.getElementById('rugMinWalletAge');
   if (rThr) onRugPlanTriggerInput(rThr.value, false);
